@@ -1,0 +1,33 @@
+{
+  "name": "@local/dsh-observational-memory",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Observational memory for long Harness sessions: background Observer/Reflector agents distil the conversation into a durable observation ledger, and compaction renders that ledger deterministically instead of re-summarizing the past.",
+  "meta": {
+    "title": "观察记忆 / Observational memory",
+    "description": "长会话的观察记忆：后台 Observer / Reflector 把对话蒸馏成持久观察账本，压缩时零模型调用地确定渲染，并可用 recall 按 id 回溯源证据。"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

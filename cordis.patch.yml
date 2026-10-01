@@ -1,0 +1,7 @@
+# Observational-memory bundle: one Host row.
+# The plugin is dependency-free (a workspace bundle has no node_modules), so it
+# reaches the harness through runtime services only: ctx.llm, ctx.tools,
+# ctx.commands, ctx.tokenMeter and the live ctx.compaction engine.
+- insert:
+    - id: observational-memory
+      name: '@local/dsh-observational-memory'
