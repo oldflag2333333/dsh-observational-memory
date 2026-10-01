@@ -30,6 +30,10 @@ const {
   renderMemory,
   activeObservations,
   activeObservationTokens,
+  observationLineTokens,
+  observationPoolMetrics,
+  conversationView,
+  reflectionCoverageMap,
   normalizeLedger,
   emptyLedger,
   serializeMessages,
@@ -42,6 +46,7 @@ const {
   runMemoryPass,
   scheduleMemoryPass,
   isRootAgent,
+  buildId,
   LedgerStore,
   LEDGER_FILENAME,
   resolveSessionDir,
@@ -82,11 +87,15 @@ function runtimeFor(ctx, rawConfig) {
 
 /** A fake agent owning a fake session with fixed model-visible messages. */
 function fakeAgent(sessionId, messages, options = {}) {
+  // Sequences are derived the way the harness derives them: one per message, in
+  // surface order. A test that cares about anchoring passes explicit `seqs`.
+  const seqs = Array.isArray(options.seqs) ? options.seqs : messages.map((_, index) => index + 1)
   return {
     options: { provider: 'test-provider', model: 'test-model' },
     session: {
       id: sessionId,
       deriveMessages: () => messages,
+      surface: { nodes: seqs },
       requestHeader: () => ({ config: { provider: 'test-provider', model: 'test-model' } })
     }
   }
@@ -98,11 +107,19 @@ function fakeAgent(sessionId, messages, options = {}) {
  */
 function fakeCtx({ replies = [], compaction, withoutLlm = false } = {}) {
   const queue = [...replies]
+  let ctxPrompts
   const registered = { tools: [], commands: [] }
   const handlers = new Map()
   const disposers = []
+  const prompts = []
+  ctxPrompts = prompts
   const llmService = {
     async *stream(options) {
+      try {
+        prompts.push(String(options?.messages?.[0]?.content?.[0]?.text ?? ''))
+      } catch {
+        /* a malformed request is the caller's problem, not the recorder's */
+      }
       const next = queue.shift()
       if (next === undefined) throw new Error('fakeCtx: no scripted reply left')
       const text = typeof next === 'function' ? next(options) : next
@@ -120,6 +137,7 @@ function fakeCtx({ replies = [], compaction, withoutLlm = false } = {}) {
     registered,
     handlers,
     compaction,
+    prompts: ctxPrompts,
     logger: { info() {}, warn() {} },
     // Deliberately NOT `llm: llmService`. Cordis throws on property access to a
     // service the plugin did not declare in `inject`, so the plugin must reach
@@ -295,7 +313,8 @@ test('normalizeLedger drops junk and coerces missing fields', () => {
     reflections: [{ id: 'cccccccccccc', content: 'a fact', supportingIds: ['aaaaaaaaaaaa', 42] }],
     dropped: ['dddddddddddd', 7],
     observedCount: -1,
-    reflectedObservationTokens: 'nope'
+    observedSeq: 'nope',
+    reflectedSeq: 3.5
   })
   assert.equal(ledger.observations.length, 1)
   assert.equal(ledger.observations[0].content, 'kept')
@@ -304,7 +323,8 @@ test('normalizeLedger drops junk and coerces missing fields', () => {
   assert.deepEqual(ledger.reflections[0].supportingIds, ['aaaaaaaaaaaa'])
   assert.deepEqual(ledger.dropped, ['dddddddddddd'])
   assert.equal(ledger.observedCount, 0, 'a negative count resets')
-  assert.equal(ledger.reflectedObservationTokens, 0)
+  assert.equal(ledger.observedSeq, undefined, 'a non-integer anchor is discarded')
+  assert.equal(ledger.reflectedSeq, undefined, 'so is a non-integer reflection anchor')
 })
 
 test('normalizeLedger survives a non-object payload', () => {
@@ -337,7 +357,11 @@ test('a drop removes an observation from the rendered memory but not the ledger'
   ledger.dropped.push('aaaaaaaaaaaa')
 
   assert.deepEqual(activeObservations(ledger).map((o) => o.id), ['bbbbbbbbbbbb'])
-  assert.equal(activeObservationTokens(ledger), 3)
+  // The pool counts the whole rendered line, not the stored content estimate:
+  // the budget caps how much observation text re-enters future contexts, and
+  // every line carries id, timestamp and relevance alongside the content.
+  assert.equal(activeObservationTokens(ledger), observationLineTokens(ledger.observations[1]))
+  assert.ok(activeObservationTokens(ledger) > 3, 'line pricing includes the metadata overhead')
   const rendered = renderMemory(ledger)
   assert.doesNotMatch(rendered, /stale detail/)
   assert.match(rendered, /live detail/)
@@ -357,7 +381,7 @@ test('an oversized ledger elides the oldest observations and says so', () => {
     })
   }
   const rendered = renderMemory(ledger)
-  assert.match(rendered, /older observation\(s\) elided/)
+  assert.match(rendered, /older observation\(s\) omitted/)
 
   // Recency wins: the newest observation survives, the oldest is gone. Plain
   // truncation would have done the opposite and silently dropped the most
@@ -365,6 +389,45 @@ test('an oversized ledger elides the oldest observations and says so', () => {
   assert.match(rendered, /observation number 399/)
   assert.doesNotMatch(rendered, /observation number 0 /)
   assert.match(rendered, /use the recall tool/, 'the preamble survives elision')
+})
+
+test('elision sheds what the budget needs, not an order of magnitude more', () => {
+  // Regression: the drop was sized with a guessed 80-character average, but real
+  // observations average ~231. One iteration therefore discarded 315 of 316
+  // observations to shed 24% of the length — a catastrophic loss the rendered
+  // text gave a reader no way to notice.
+  const ledger = emptyLedger('s')
+  for (let index = 0; index < 316; index += 1) {
+    ledger.observations.push({
+      id: memoryId('observation', String(index)),
+      content: 'x'.repeat(231),
+      timestamp: '2026-10-01 14:41',
+      relevance: 'medium',
+      tokens: 58,
+      evidence: ''
+    })
+  }
+  const rendered = renderMemory(ledger)
+  const kept = (rendered.match(/^\[[0-9a-f]{12}\]/gm) ?? []).length
+  const elided = Number((rendered.match(/\[(\d+) older observation/) ?? [])[1])
+
+  assert.equal(kept + elided, 316, 'every observation is either kept or accounted for')
+  assert.ok(kept > 150, `expected most observations to survive, kept ${kept}`)
+  assert.ok(rendered.length <= 62000, `expected the render to respect the budget, got ${rendered.length}`)
+
+  // The point of the fix: shed enough, never far more than enough.
+  assert.ok(elided / 316 < 0.5, `shed ${((elided / 316) * 100).toFixed(1)}% for a 24% overflow`)
+})
+
+test('elision still converges when one observation exceeds the whole budget', () => {
+  const ledger = emptyLedger('s')
+  ledger.observations.push(
+    { id: 'aaaaaaaaaaaa', content: 'a'.repeat(200000), timestamp: 't', relevance: 'low', tokens: 1, evidence: '' },
+    { id: 'bbbbbbbbbbbb', content: 'b'.repeat(200000), timestamp: 't', relevance: 'low', tokens: 1, evidence: '' }
+  )
+  const rendered = renderMemory(ledger)
+  assert.match(rendered, /\[bbbbbbbbbbbb\]/, 'the newest survives even when it alone is oversized')
+  assert.doesNotMatch(rendered, /\[aaaaaaaaaaaa\]/)
 })
 
 test('a ledger just over the cap is elided down to the cap, never beyond', () => {
@@ -594,15 +657,283 @@ test('runObserver does nothing below the threshold', async () => {
   assert.equal(await runObserver(runtime, agent, ledger, undefined), null)
 })
 
-test('runObserver resets coverage when the surface shrank (a compaction happened)', async () => {
+test('an anchor that a compaction removed re-reads the surviving history', async () => {
+  // The anchor is an identity, so a surface replacement resolves it to nothing
+  // and the ledger reads what survived. The old counter needed a hand-written
+  // "did the list shrink?" heuristic, which is how the count and the token total
+  // came to disagree in the first place.
   const ctx = fakeCtx({ replies: [JSON.stringify([{ content: 'post-compaction state', relevance: 'medium' }])] })
   const runtime = runtimeFor(ctx, { observeAfterTokens: 10 })
   const ledger = await runtime.store.load('session-shrunk')
+  ledger.observedSeq = 9999 // a sequence the new surface does not contain
   ledger.observedCount = 50
-  const agent = fakeAgent('session-shrunk', [{ role: 'user', content: [{ type: 'text', text: `surviving ${lorem}` }] }])
+  const agent = fakeAgent('session-shrunk', [{ role: 'user', content: [{ type: 'text', text: `surviving ${lorem}` }] }], {
+    seqs: [1000]
+  })
   await runObserver(runtime, agent, ledger, undefined)
   assert.equal(ledger.observations.length, 1)
   assert.equal(ledger.observedCount, 1)
+  assert.equal(ledger.observedSeq, 1000, 'the anchor moves to the surviving message')
+})
+
+// ---------------------------------------------------------------------------
+// Threshold semantics (ported from the original's two measurement kinds)
+// ---------------------------------------------------------------------------
+
+test('the reflector is due on conversation flow, not on pool size', async () => {
+  // The bug this pins: the reflector compared the observation POOL against a
+  // threshold meant for conversational FLOW. Observations are condensed, so a
+  // pool of 316 represented ~560k tokens of conversation while weighing ~18k —
+  // it could never reach a 20k threshold, and the reflector was unreachable code
+  // no matter how long the session ran.
+  const ctx = fakeCtx({ replies: [JSON.stringify([{ content: 'a durable fact', supportingIds: [] }])] })
+  const runtime = runtimeFor(ctx, { reflectAfterTokens: 20000 })
+  // A real surface, so anchors resolve and the flow is measurable.
+  // Measured: ~104 tokens per message here, so clearing a 20k threshold takes
+  // ~200 messages. Sized from the measurement, not from an estimate.
+  const conversation = Array.from({ length: 220 }, (_, index) => ({
+    role: 'user',
+    content: [{ type: 'text', text: `turn ${index} ${'x'.repeat(400)}` }]
+  }))
+  const seqs = conversation.map((_, index) => 1000 + index)
+  const agent = fakeAgent('session-flow', conversation, { seqs })
+
+  // A huge pool with no new conversation since the last reflection: not due.
+  const stocked = await runtime.store.load('session-flow-stocked')
+  // ~52 tokens per rendered observation line, so clearing a 20k pool takes ~400.
+  for (let index = 0; index < 420; index += 1) {
+    stocked.observations.push({
+      id: memoryId('observation', `s${index}`),
+      content: 'a very long observation that inflates the pool considerably '.repeat(3),
+      timestamp: 't',
+      relevance: 'medium',
+      tokens: 100,
+      evidence: ''
+    })
+  }
+  // Both anchors rest on the last message: nothing has flowed past the reflector.
+  stocked.observedSeq = seqs[seqs.length - 1]
+  stocked.reflectedSeq = seqs[seqs.length - 1]
+  stocked.observedCount = conversation.length
+  assert.equal(
+    await runReflector(runtime, agent, stocked, undefined),
+    null,
+    'a big pool with no new conversation is not a reason to reflect'
+  )
+  assert.ok(activeObservationTokens(stocked) > 20000, 'the pool really is over the threshold')
+
+  // A small pool with plenty of new conversation since: due.
+  const fresh = await runtime.store.load('session-flow-fresh')
+  fresh.observations.push({ id: 'aaaaaaaaaaaa', content: 'one observation', timestamp: 't', relevance: 'medium', tokens: 5, evidence: '' })
+  // The observation anchor sits at the end while the reflection anchor sits at
+  // the start, so the whole conversation has flowed past the reflector.
+  fresh.observedSeq = seqs[seqs.length - 1]
+  fresh.observedCount = conversation.length
+  fresh.reflectedSeq = seqs[0]
+  assert.match(await runReflector(runtime, agent, fresh, undefined), /recorded 1 new reflection/)
+
+  // And the reflection anchor advances onto the conversation just reasoned over.
+  assert.equal(fresh.reflectedSeq, fresh.observedSeq)
+})
+
+test('the reflection anchor only advances when the run concluded something', async () => {
+  // The defect this pins: the anchor advanced unconditionally, so a run that
+  // distilled nothing — or whose output could not be parsed — marked the
+  // conversation as reflected anyway and retired it permanently. The clock would
+  // then read zero however much unreflected history sat behind it.
+  const conversation = Array.from({ length: 220 }, (_, index) => ({
+    role: 'user',
+    content: [{ type: 'text', text: `turn ${index} ${'x'.repeat(400)}` }]
+  }))
+  const seqs = conversation.map((_, index) => 1000 + index)
+
+  const empty = fakeCtx({ replies: [JSON.stringify([])] })
+  const emptyRuntime = runtimeFor(empty, { reflectAfterTokens: 20000 })
+  const emptyLedger = await emptyRuntime.store.load('session-reflect-empty')
+  emptyLedger.observations.push({ id: 'aaaaaaaaaaaa', content: 'a fact', timestamp: 't', relevance: 'medium', tokens: 5, evidence: '' })
+  emptyLedger.observedSeq = seqs[seqs.length - 1]
+  emptyLedger.observedCount = conversation.length
+  emptyLedger.reflectedSeq = seqs[0]
+
+  const emptyOutcome = await runReflector(emptyRuntime, fakeAgent('session-reflect-empty', conversation, { seqs }), emptyLedger, undefined)
+  assert.match(emptyOutcome, /coverage left unchanged/)
+  assert.equal(emptyLedger.reflectedSeq, seqs[0], 'the anchor did not move')
+  assert.equal(emptyLedger.reflections.length, 0)
+
+  const broken = fakeCtx({ replies: ['not json at all'] })
+  const brokenRuntime = runtimeFor(broken, { reflectAfterTokens: 20000 })
+  const brokenLedger = await brokenRuntime.store.load('session-reflect-broken')
+  brokenLedger.observations.push({ id: 'bbbbbbbbbbbb', content: 'a fact', timestamp: 't', relevance: 'medium', tokens: 5, evidence: '' })
+  brokenLedger.observedSeq = seqs[seqs.length - 1]
+  brokenLedger.observedCount = conversation.length
+  brokenLedger.reflectedSeq = seqs[0]
+
+  const brokenOutcome = await runReflector(brokenRuntime, fakeAgent('session-reflect-broken', conversation, { seqs }), brokenLedger, undefined)
+  assert.match(brokenOutcome, /unparseable/)
+  assert.equal(brokenLedger.reflectedSeq, seqs[0], 'nor did a failed run move it')
+
+  // A run that produces a conclusion does advance it.
+  const good = fakeCtx({ replies: [JSON.stringify([{ content: 'a durable conclusion', supportingIds: [] }])] })
+  const goodRuntime = runtimeFor(good, { reflectAfterTokens: 20000 })
+  const goodLedger = await goodRuntime.store.load('session-reflect-good')
+  goodLedger.observations.push({ id: 'cccccccccccc', content: 'a fact', timestamp: 't', relevance: 'medium', tokens: 5, evidence: '' })
+  goodLedger.observedSeq = seqs[seqs.length - 1]
+  goodLedger.observedCount = conversation.length
+  goodLedger.reflectedSeq = seqs[0]
+
+  await runReflector(goodRuntime, fakeAgent('session-reflect-good', conversation, { seqs }), goodLedger, undefined)
+  assert.equal(goodLedger.reflectedSeq, seqs[seqs.length - 1], 'a real conclusion advances it')
+})
+
+test('restating an existing reflection still counts as reflecting', async () => {
+  // The run did reason over the conversation and answered "these still hold",
+  // which is a conclusion. Treating it as no progress would re-run the reflector
+  // forever on the same span.
+  const conversation = Array.from({ length: 220 }, (_, index) => ({
+    role: 'user',
+    content: [{ type: 'text', text: `turn ${index} ${'x'.repeat(400)}` }]
+  }))
+  const seqs = conversation.map((_, index) => 1000 + index)
+  const content = 'the project targets a January ship date'
+
+  const ctx = fakeCtx({ replies: [JSON.stringify([{ content, supportingIds: [] }])] })
+  const runtime = runtimeFor(ctx, { reflectAfterTokens: 20000 })
+  const ledger = await runtime.store.load('session-reflect-restate')
+  // The reflector needs an observation pool to distil from, and an existing
+  // reflection to restate.
+  ledger.observations.push({ id: 'dddddddddddd', content: 'a fact', timestamp: 't', relevance: 'medium', tokens: 5, evidence: '' })
+  ledger.reflections.push({ id: memoryId('reflection', content), content, supportingIds: [], tokens: 8 })
+  ledger.observedSeq = seqs[seqs.length - 1]
+  ledger.observedCount = conversation.length
+  ledger.reflectedSeq = seqs[0]
+
+  const outcome = await runReflector(runtime, fakeAgent('session-reflect-restate', conversation, { seqs }), ledger, undefined)
+  assert.match(outcome, /restated 1/)
+  assert.equal(ledger.reflections.length, 1, 'no duplicate reflection was appended')
+  assert.equal(ledger.reflectedSeq, seqs[seqs.length - 1], 'and the anchor moved')
+})
+
+test('coverage tiers count citations, so one reflection is only partial', async () => {
+  // The defect this pins: coverage was a boolean, so an observation cited by a
+  // single reflection was labelled `strong` — the strongest pruning signal the
+  // dropper receives — where the original calls that `partial`. The error runs in
+  // the dangerous direction: it invites pruning memory the reflections do not
+  // really preserve.
+  const observations = [
+    { id: 'aaaaaaaaaaaa', content: 'cited twice', timestamp: 't', relevance: 'high', tokens: 5, evidence: '' },
+    { id: 'bbbbbbbbbbbb', content: 'cited once', timestamp: 't', relevance: 'high', tokens: 5, evidence: '' },
+    { id: 'cccccccccccc', content: 'not cited', timestamp: 't', relevance: 'high', tokens: 5, evidence: '' }
+  ]
+  const reflections = [
+    { id: 'r1', content: 'one', supportingIds: ['aaaaaaaaaaaa', 'bbbbbbbbbbbb'], tokens: 2 },
+    { id: 'r2', content: 'two', supportingIds: ['aaaaaaaaaaaa'], tokens: 2 }
+  ]
+
+  const tiers = reflectionCoverageMap(observations, reflections)
+  assert.equal(tiers.get('aaaaaaaaaaaa'), 'strong', 'two reflections citing it')
+  assert.equal(tiers.get('bbbbbbbbbbbb'), 'partial', 'one reflection citing it')
+  assert.equal(tiers.get('cccccccccccc'), 'none', 'no reflection citing it')
+
+  // A duplicate id inside one reflection is one piece of evidence, not two.
+  const duplicated = reflectionCoverageMap(observations, [
+    { id: 'r3', content: 'dup', supportingIds: ['bbbbbbbbbbbb', 'bbbbbbbbbbbb'], tokens: 2 }
+  ])
+  assert.equal(duplicated.get('bbbbbbbbbbbb'), 'partial')
+
+  const ctx = fakeCtx({ replies: [JSON.stringify([])] })
+  const runtime = runtimeFor(ctx, { observationsPoolTargetTokens: 10 })
+  const ledger = emptyLedger('session-tier')
+  ledger.observations.push(...observations)
+  ledger.reflections.push(...reflections)
+  await runDropper(runtime, fakeAgent('session-tier', []), ledger, undefined)
+
+  const prompt = ctx.prompts.find((entry) => entry.includes('coverage:'))
+  assert.ok(prompt !== undefined, 'the dropper prompt carries coverage annotations')
+  assert.match(prompt, /coverage: strong/)
+  assert.match(prompt, /coverage: partial/)
+  assert.match(prompt, /coverage: none/)
+})
+
+test('the dropper triggers on the pool TARGET, not the pool maximum', async () => {
+  // In the original these are two budgets with different jobs: the maximum only
+  // decides whether compaction renders a full fold, the target is what the
+  // dropper trims toward. Using the maximum as the trigger made pruning late by
+  // design, because it is twice the target.
+  const ctx = fakeCtx({ replies: [JSON.stringify([])] })
+  const runtime = runtimeFor(ctx, { observationsPoolTargetTokens: 1000, observationsPoolMaxTokens: 20000 })
+  const ledger = await runtime.store.load('session-target')
+  // Deliberately between target and maximum: a pool in this band must still prune.
+  for (let index = 0; index < 12; index += 1) {
+    ledger.observations.push({
+      id: memoryId('observation', `t${index}`),
+      content: 'x'.repeat(400),
+      timestamp: 't',
+      relevance: 'medium',
+      tokens: 100,
+      evidence: ''
+    })
+  }
+  const pool = observationPoolMetrics(activeObservations(ledger), 1000)
+  assert.ok(pool.observationTokens > 1000 && pool.observationTokens < 20000, 'pool sits between target and max')
+  assert.equal(pool.ready, true, 'and is therefore prunable')
+
+  // The run reaches the model, which is only possible past the readiness gate.
+  const outcome = await runDropper(runtime, fakeAgent('session-target', []), ledger, undefined)
+  assert.match(outcome, /dropper:/)
+  assert.match(outcome, /allowed towards a 1000-token target/)
+})
+
+test('the drop budget caps the model, which cannot gut the pool', async () => {
+  // A model that returns every id it was shown is over-reaching; honouring it
+  // would discard memory the budget never asked to shed.
+  const observations = Array.from({ length: 10 }, (_, index) => ({
+    id: memoryId('observation', `c${index}`),
+    content: 'y'.repeat(400),
+    timestamp: 't',
+    relevance: 'medium',
+    tokens: 100,
+    evidence: ''
+  }))
+  // 10 lines at ~110 tokens each is ~1100, so the target must sit below that.
+  const pool = observationPoolMetrics(observations, 500)
+  assert.equal(pool.activeObservationCount, 10)
+  assert.ok(pool.maxDropsAllowed > 0 && pool.maxDropsAllowed < 10, `expected a partial cap, got ${pool.maxDropsAllowed}`)
+
+  const ctx = fakeCtx({ replies: [JSON.stringify(observations.map((item) => item.id))] })
+  const runtime = runtimeFor(ctx, { observationsPoolTargetTokens: 500 })
+  const ledger = await runtime.store.load('session-cap')
+  ledger.observations.push(...observations)
+
+  await runDropper(runtime, fakeAgent('session-cap', []), ledger, undefined)
+  assert.equal(ledger.dropped.length, pool.maxDropsAllowed, 'the budget bounded the model')
+})
+
+test('pool metrics price whole lines and never report an empty pool as prunable', () => {
+  const observation = { id: 'aaaaaaaaaaaa', content: 'x'.repeat(400), timestamp: '2026-01-01 00:00', relevance: 'high', tokens: 100, evidence: '' }
+  const line = observationLineTokens(observation)
+  assert.ok(line > estimateTokens(observation.content), 'line pricing exceeds the bare content')
+  assert.ok(line > observation.tokens, 'and exceeds the stored content estimate, so metadata is counted')
+
+  const empty = observationPoolMetrics([], 1000)
+  assert.equal(empty.ready, false)
+  assert.equal(empty.maxDropsAllowed, 0)
+  assert.equal(empty.observationTokens, 0)
+
+  // Exactly on target is not over target.
+  const at = observationPoolMetrics([observation], observationLineTokens(observation))
+  assert.equal(at.overTarget, false)
+  assert.equal(at.ready, false, 'an exactly-on-target pool is never pruned')
+
+  // A non-positive target is rejected rather than dividing by zero.
+  const bad = observationPoolMetrics([observation], 0)
+  assert.equal(bad.fullness, 0)
+  assert.equal(bad.ready, false)
+})
+
+test('the pool target defaults to half the maximum, as in the original', () => {
+  assert.equal(resolveConfig({}).observationsPoolTargetTokens, 10000)
+  assert.equal(resolveConfig({ observationsPoolMaxTokens: 40000 }).observationsPoolTargetTokens, 20000)
+  assert.equal(resolveConfig({ observationsPoolMaxTokens: 40000, observationsPoolTargetTokens: 5000 }).observationsPoolTargetTokens, 5000)
 })
 
 test('runReflector keeps only supporting ids that name a live observation', async () => {
@@ -614,10 +945,18 @@ test('runReflector keeps only supporting ids that name a live observation', asyn
   const runtime = runtimeFor(ctx, { reflectAfterTokens: 5 })
   const ledger = await runtime.store.load('session-reflector')
   ledger.observations.push({ id: 'aaaaaaaaaaaa', content: 'uses Supabase', timestamp: 't', relevance: 'high', tokens: 10, evidence: '' })
-  const agent = fakeAgent('session-reflector', [])
+  // The reflector is due on raw conversation that has flowed past its anchor, not
+  // on the size of the observation pool.
+  const turns = Array.from({ length: 50 }, (_, index) => ({
+    role: 'user',
+    content: [{ type: 'text', text: `t${index} ${'y'.repeat(400)}` }]
+  }))
+  ledger.observedSeq = 49
+  ledger.observedCount = 50
+  const agent = fakeAgent('session-reflector', turns, { seqs: turns.map((_, index) => index) })
 
   const outcome = await runReflector(runtime, agent, ledger, undefined)
-  assert.match(outcome, /recorded 1 reflection/)
+  assert.match(outcome, /recorded 1 new reflection/)
   assert.deepEqual(ledger.reflections[0].supportingIds, ['aaaaaaaaaaaa'], 'unknown ids are not pruning evidence')
 })
 
@@ -661,11 +1000,76 @@ test('runMemoryPass orders observe, reflect, then prune', async () => {
       JSON.stringify([{ content: 'the project is underway', supportingIds: [] }])
     ]
   })
-  const runtime = runtimeFor(ctx, { observeAfterTokens: 10, reflectAfterTokens: 1, observationsPoolMaxTokens: 100000 })
+  const runtime = runtimeFor(ctx, {
+    observeAfterTokens: 10,
+    reflectAfterTokens: 1,
+    observationsPoolMaxTokens: 100000,
+    // Pinned to the sequential default: this test is about ordering, and catch-up
+    // would need one scripted reply per chunk.
+    catchUpChunksPerPass: 1
+  })
   const outcomes = await runMemoryPass(runtime, fakeAgent('session-pass', messages), undefined)
-  assert.equal(outcomes.length, 2, 'no dropper run: the pool is under budget')
+  assert.equal(outcomes.length, 2, 'no dropper run: the pool is under target')
   assert.match(outcomes[0], /^observer:/)
   assert.match(outcomes[1], /^reflector:/)
+})
+
+test('catch-up drains the backlog in one pass, up to its cap', async () => {
+  // Four chunks are due; the cap is three, so the pass reads three and says so.
+  const messages = Array.from({ length: 4 }, (_, index) => ({
+    role: 'user',
+    content: [{ type: 'text', text: `chunk ${index} ${'z'.repeat(400)}` }]
+  }))
+  const ctx = fakeCtx({
+    replies: [
+      JSON.stringify([{ content: 'one', relevance: 'medium' }]),
+      JSON.stringify([{ content: 'two', relevance: 'medium' }]),
+      JSON.stringify([{ content: 'three', relevance: 'medium' }])
+    ]
+  })
+  const runtime = runtimeFor(ctx, {
+    observeAfterTokens: 5,
+    reflectAfterTokens: 1000000,
+    observerChunkMaxTokens: 60,
+    catchUpChunksPerPass: 3
+  })
+  const agent = fakeAgent('session-catchup', messages)
+  const outcomes = await runMemoryPass(runtime, agent, undefined)
+
+  const observers = outcomes.filter((line) => line.startsWith('observer:'))
+  assert.equal(observers.length, 3, 'three chunks in one pass instead of one')
+  assert.match(outcomes[outcomes.length - 1], /catch-up: stopped at the 3-chunk cap/)
+  assert.equal(runtime.stats.catchUpChunks, 3)
+  assert.equal(runtime.stats.catchUpActive, true, 'backlog remains')
+
+  // The ledger really did advance three chunks' worth.
+  const ledger = await runtime.store.load('session-catchup')
+  assert.equal(ledger.observations.length, 3)
+  assert.ok(ledger.observedCount > 1)
+})
+
+test('catch-up reports convergence when the backlog empties', async () => {
+  const messages = [{ role: 'user', content: [{ type: 'text', text: `only chunk ${lorem}` }] }]
+  const ctx = fakeCtx({ replies: [JSON.stringify([{ content: 'the only one', relevance: 'medium' }])] })
+  const runtime = runtimeFor(ctx, {
+    observeAfterTokens: 5,
+    reflectAfterTokens: 1000000,
+    observerChunkMaxTokens: 100000,
+    catchUpChunksPerPass: 10
+  })
+  const outcomes = await runMemoryPass(runtime, fakeAgent('session-converged', messages), undefined)
+
+  assert.equal(outcomes.filter((line) => line.startsWith('observer:')).length, 1)
+  assert.equal(runtime.stats.catchUpChunks, 1)
+  assert.equal(runtime.stats.catchUpActive, false, 'nothing was left behind')
+  assert.doesNotMatch(outcomes.join(' '), /chunk cap/)
+})
+
+test('the catch-up cap is configurable and defaults to sequential', () => {
+  assert.equal(resolveConfig({}).catchUpChunksPerPass, 1, 'one chunk per pass unless asked otherwise')
+  assert.equal(resolveConfig({ catchUpChunksPerPass: 40 }).catchUpChunksPerPass, 40)
+  assert.equal(resolveConfig({ catchUpChunksPerPass: 0 }).catchUpChunksPerPass, 1, 'zero is not a valid cap')
+  assert.equal(resolveConfig({ catchUpChunksPerPass: -5 }).catchUpChunksPerPass, 1)
 })
 
 // ---------------------------------------------------------------------------
@@ -692,6 +1096,55 @@ test('runMemoryPass owns coherent accounting for both of its callers', async () 
   assert.equal(broken.stats.passesCompleted, 0)
   assert.equal(broken.stats.passesFailed, 1)
   assert.match(broken.stats.lastError, /llm service is not mounted/)
+})
+
+test('a hung run is reclaimed instead of silencing every later turn', async () => {
+  // The failure this prevents was observed live: one memory call never returned,
+  // the in-flight slot stayed held, and because the scheduler skips a session
+  // that already has a run, memory never started again for the whole process.
+  const ctx = fakeCtx({ replies: [] })
+  const runtime = runtimeFor(ctx, { passTimeoutMs: 30 })
+  // A pass that never settles.
+  runtime.store.load = () => new Promise(() => {})
+  const agent = fakeAgent('session-hung', [])
+
+  scheduleMemoryPass(runtime, agent)
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(runtime.stats.passesStarted, 1)
+
+  // A second attempt inside the window is refused: runs must not stack.
+  scheduleMemoryPass(runtime, agent)
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(runtime.stats.passesStarted, 1, 'still in flight, so not restarted')
+
+  // Once the slot is stale, the next turn reclaims it.
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  scheduleMemoryPass(runtime, agent)
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(runtime.stats.stalePassesReclaimed, 1, 'the stale slot was reclaimed')
+  assert.equal(runtime.stats.passesStarted, 2, 'and a new run started')
+})
+
+test('a slow memory call is bounded by the timeout', async () => {
+  const ctx = fakeCtx({ replies: [] })
+  // `ctx.llm` is deliberately not a property (Cordis refuses undeclared service
+  // access), so the slow stream is installed on the service itself. It yields
+  // nothing and then ends, which is a stream that outlives the deadline without
+  // wedging the async iterator's own teardown.
+  ctx.get('llm').stream = () => ({
+    [Symbol.asyncIterator]() {
+      return {
+        next: () => new Promise((resolve) => setTimeout(() => resolve({ done: true, value: undefined }), 200)),
+        return: () => Promise.resolve({ done: true, value: undefined })
+      }
+    }
+  })
+  const runtime = runtimeFor(ctx, { observeAfterTokens: 10, callTimeoutMs: 40 })
+  const ledger = await runtime.store.load('session-timeout')
+  const agent = fakeAgent('session-timeout', [{ role: 'user', content: [{ type: 'text', text: `hi ${lorem}` }] }])
+
+  await assert.rejects(() => runObserver(runtime, agent, ledger, undefined), /timed out after 40ms/)
+  assert.equal(ledger.observedCount, 0, 'a timed-out run must not advance coverage')
 })
 
 test('the scheduler counts one pass exactly once', async () => {
@@ -825,10 +1278,31 @@ test('the compaction wrapper renders memory instead of calling the summarizer', 
   const ledger = await runtime.store.load('session-compact')
   ledger.observations.push({ id: 'aaaaaaaaaaaa', content: 'a remembered decision', timestamp: 't', relevance: 'high', tokens: 6, evidence: '' })
   // Caught up: the ledger has read more than this compaction will replace.
-  ledger.observedTokens = 100000
+  // A resolvable anchor covering the whole (tiny) surface, so the gate can pass
+  // on size alone: the render is smaller than the region it would replace.
+  // The gate compares the covered prefix with the region about to be replaced, so
+  // the fixture must be one the ledger genuinely covers: reading one short message
+  // does not license replacing a 25k-token span, and a test that claimed otherwise
+  // would be asserting the gate is broken.
+  // Two conditions gate the render, and the fixture must satisfy both: the ledger
+  // must cover the region being replaced, and the render must be smaller than it.
+  // The memory block carries a fixed preamble, so the region has to be
+  // comfortably larger than that or the honest answer is to fall back.
+  // Three quantities have to line up for the render to stand in: the ledger must
+  // have READ at least as much as the region being replaced, and the render must
+  // be SMALLER than that region. The memory block carries a fixed ~200-token
+  // preamble, so the covered conversation is a genuinely long one here.
+  const covering = [{ role: 'user', content: [{ type: 'text', text: 'y'.repeat(40000) }] }]
+  const agent = fakeAgent('session-compact', covering, { seqs: [1] })
+  ledger.observedSeq = 1
+  ledger.observedCount = 1
 
   assert.equal(installCompactionRenderer(runtime), true)
-  const result = await engine.summarize({ messages: [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(100000) }] }] }, fakeAgent('session-compact', []), undefined)
+  const result = await engine.summarize(
+    { messages: [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(20000) }] }] },
+    agent,
+    undefined
+  )
 
   assert.equal(result.llmStreamCall, false, 'memory rendering is not a model call')
   assert.match(result.summary[0].text, /a remembered decision/)
@@ -847,7 +1321,8 @@ test('a ledger that does not cover the shadowed region is refused, not rendered'
   const runtime = runtimeFor(ctx)
   const ledger = await runtime.store.load('session-uncovered')
   ledger.observations.push({ id: 'aaaaaaaaaaaa', content: 'only the very beginning', timestamp: 't', relevance: 'high', tokens: 6, evidence: '' })
-  ledger.observedTokens = 12000 // read 12k tokens …
+  ledger.observedSeq = 999999 // an anchor the surface cannot resolve
+  ledger.observedCount = 1
 
   installCompactionRenderer(runtime)
   const bigRegion = { messages: [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(400000) }] }] }
@@ -866,7 +1341,8 @@ test('a small uncovered region is still refused', async () => {
   const runtime = runtimeFor(ctx)
   const ledger = await runtime.store.load('session-small-uncovered')
   ledger.observations.push({ id: 'aaaaaaaaaaaa', content: 'memory', timestamp: 't', relevance: 'high', tokens: 2, evidence: '' })
-  ledger.observedTokens = 100
+  ledger.observedSeq = 999999
+  ledger.observedCount = 1
 
   installCompactionRenderer(runtime)
   const result = await engine.summarize({ messages: [{ role: 'user', content: [{ type: 'text', text: 'y'.repeat(4000) }] }] }, fakeAgent('session-small-uncovered', []), undefined)
@@ -875,49 +1351,69 @@ test('a small uncovered region is still refused', async () => {
 })
 
 test('coversShadowedRegion is the coverage invariant, not a size proxy', () => {
-  assert.equal(coversShadowedRegion({ observedTokens: 100 }, 100), true, 'exactly covered is covered')
-  assert.equal(coversShadowedRegion({ observedTokens: 99 }, 100), false)
-  assert.equal(coversShadowedRegion({ observedTokens: 1000 }, 100), true)
-  assert.equal(coversShadowedRegion({ observedTokens: 1000 }, 0), false, 'an unknown region is not covered')
-  assert.equal(coversShadowedRegion({ observedTokens: 1000 }, Number.NaN), false)
+  assert.equal(coversShadowedRegion({}, 100, 100), true, 'exactly covered is covered')
+  assert.equal(coversShadowedRegion({}, 100, 99), false)
+  assert.equal(coversShadowedRegion({}, 100, 1000), true)
+  assert.equal(coversShadowedRegion({}, 0, 1000), false, 'an unknown region is not covered')
+  assert.equal(coversShadowedRegion({}, Number.NaN, 1000), false)
+  assert.equal(coversShadowedRegion({}, 100, undefined), false, 'an unreadable anchor refuses rather than assumes')
 })
 
-test('the coverage watermark is reconciled upward, never left under-reported', async () => {
-  // Two real shapes need this. A ledger written before `observedTokens` existed
-  // reads as 0. A ledger written by a version that only accumulated *new* chunks
-  // under-reports everything read before it. Either way the gate would refuse
-  // memory the ledger genuinely holds, and the feature would stay dormant even
-  // once coverage is complete.
+test('the anchor decides coverage: resolvable reads through itself, stale re-reads', () => {
+  // The anchor is the only persisted watermark, so there is nothing to reconcile:
+  // a ledger whose anchor the surface cannot resolve re-reads the surviving
+  // history, and one whose anchor resolves yields an exact covered prefix. Both
+  // are derived on demand, never accumulated — which is what removes the drift
+  // that let a count and a token total disagree.
   const messages = [
     { role: 'user', content: [{ type: 'text', text: `first ${lorem}` }] },
     { role: 'assistant', content: [{ type: 'text', text: `second ${lorem}` }] }
   ]
-  const ctx = fakeCtx({ replies: [] })
-  ctx.tokenMeter = { estimateMessage: (message) => Math.ceil(JSON.stringify(message).length / 4) }
-  const runtime = runtimeFor(ctx, { observeAfterTokens: 1000000 })
-  const agent = fakeAgent('session-migrate', messages)
+  const agent = fakeAgent('anchor-shapes', messages, { seqs: [10, 11] })
+  const runtime = runtimeFor(fakeCtx())
 
-  // (a) the old shape: no watermark at all.
-  const zero = await runtime.store.load('session-migrate-zero')
-  zero.observations.push({ id: 'aaaaaaaaaaaa', content: 'old', timestamp: 't', relevance: 'high', tokens: 2, evidence: '' })
-  zero.observedCount = 2
-  assert.equal(await runObserver(runtime, agent, zero, undefined), null, 'nothing new to observe')
-  assert.ok(zero.observedTokens > 0, `expected a migrated watermark, got ${zero.observedTokens}`)
-  assert.equal(coversShadowedRegion(zero, zero.observedTokens - 1), true, 'and it now licenses a render')
+  const resolvable = emptyLedger('anchor-A')
+  resolvable.observedSeq = 11
+  const a = conversationView(runtime, agent, resolvable)
+  assert.equal(a.coveredCount, 2, 'a resolvable anchor covers through itself')
+  assert.equal(a.pending.length, 0)
+  assert.ok(a.coveredTokens > 0)
+  assert.equal(a.coveredTokens + 0 >= a.coveredTokens, true)
 
-  // (b) the partial shape: a watermark that under-reports what was read.
-  const partial = await runtime.store.load('session-migrate-partial')
-  partial.observations.push({ id: 'bbbbbbbbbbbb', content: 'old', timestamp: 't', relevance: 'high', tokens: 2, evidence: '' })
-  partial.observedCount = 2
-  partial.observedTokens = 7
-  await runObserver(runtime, agent, partial, undefined)
-  assert.ok(partial.observedTokens > 7, `expected a raised watermark, got ${partial.observedTokens}`)
+  const stale = emptyLedger('anchor-B')
+  stale.observedSeq = 999
+  const b = conversationView(runtime, agent, stale)
+  assert.equal(b.coveredCount, 0, 'an unresolvable anchor re-reads the surviving history')
+  assert.equal(b.pending.length, 2)
+  assert.equal(b.coveredTokens, 0)
+  assert.equal(b.pendingTokens, b.conversationTokens, 'everything is pending again')
 
-  // And it never lowers: reconciliation is one-directional, so it cannot make the
-  // gate more permissive than the ledger's real coverage.
-  partial.observedTokens = 10_000_000
-  await runObserver(runtime, agent, partial, undefined)
-  assert.equal(partial.observedTokens, 10_000_000)
+  // Middle anchor: the prefix is exactly what precedes it.
+  const middle = emptyLedger('anchor-C')
+  middle.observedSeq = 10
+  const c = conversationView(runtime, agent, middle)
+  assert.equal(c.coveredCount, 1)
+  assert.equal(c.pending.length, 1)
+  assert.equal(c.coveredTokens + c.pendingTokens, c.conversationTokens, 'the parts sum to the whole')
+
+  // A caller-supplied anchor measures a different clock from the same surface:
+  // this is how the reflector gets its own reading without a private total.
+  const d = conversationView(runtime, agent, resolvable, 10)
+  assert.equal(d.coveredCount, 1, 'an explicit anchor overrides the ledger one')
+})
+
+test('an explicit anchor survives a surface that cannot be read', () => {
+  // Without sequences the view still works by count, which is the weaker
+  // guarantee this model replaces; it must not throw.
+  const messages = [{ role: 'user', content: [{ type: 'text', text: 'only' }] }]
+  const agent = { session: { deriveMessages: () => messages } }
+  const ledger = emptyLedger('anchor-D')
+  ledger.observedCount = 1
+
+  const view = conversationView(runtimeFor(fakeCtx()), agent, ledger)
+  assert.equal(view.aligned, false)
+  assert.equal(view.coveredCount, 1, 'the count is the fallback')
+  assert.equal(view.pending.length, 0)
 })
 
 test('the observer accumulates token coverage as it reads', async () => {
@@ -931,22 +1427,32 @@ test('the observer accumulates token coverage as it reads', async () => {
   })
   const runtime = runtimeFor(ctx, { observeAfterTokens: 10 })
   const ledger = await runtime.store.load('session-coverage')
-  assert.equal(ledger.observedTokens, 0)
+  assert.equal(ledger.observedSeq, undefined)
 
-  await runObserver(runtime, fakeAgent('session-coverage', messages), ledger, undefined)
-  const afterFirst = ledger.observedTokens
-  assert.ok(afterFirst > 0, 'reading a chunk raises coverage')
+  const firstSeq = [11]
+  const agent = fakeAgent('session-coverage', messages, { seqs: firstSeq })
+  await runObserver(runtime, agent, ledger, undefined)
+  assert.equal(ledger.observedSeq, 11, 'reading a chunk moves the anchor')
+  const afterFirst = conversationView(runtime, agent, ledger).coveredTokens
+  assert.ok(afterFirst > 0, 'and that yields a covered total')
 
-  await runObserver(runtime, fakeAgent('session-coverage', more), ledger, undefined)
-  assert.ok(ledger.observedTokens > afterFirst, 'coverage is monotonic across chunks')
+  const moreSeqs = [11, 12]
+  const agent2 = fakeAgent('session-coverage', more, { seqs: moreSeqs })
+  await runObserver(runtime, agent2, ledger, undefined)
+  assert.equal(ledger.observedSeq, 12, 'the anchor advances with each chunk')
+  assert.ok(
+    conversationView(runtime, agent2, ledger).coveredTokens > afterFirst,
+    'coverage grows as more is read'
+  )
   assert.equal(ledger.observations.length, 2)
 })
 
-test('normalizeLedger coerces the coverage watermark', () => {
-  assert.equal(normalizeLedger('s', { observedTokens: 500 }).observedTokens, 500)
-  assert.equal(normalizeLedger('s', { observedTokens: -1 }).observedTokens, 0)
-  assert.equal(normalizeLedger('s', { observedTokens: 'nope' }).observedTokens, 0)
-  assert.equal(normalizeLedger('s', {}).observedTokens, 0)
+test('normalizeLedger coerces the sequence anchors', () => {
+  assert.equal(normalizeLedger('s', { observedSeq: 500 }).observedSeq, 500)
+  assert.equal(normalizeLedger('s', { observedSeq: -1 }).observedSeq, undefined)
+  assert.equal(normalizeLedger('s', { observedSeq: 'nope' }).observedSeq, undefined)
+  assert.equal(normalizeLedger('s', {}).observedSeq, undefined)
+  assert.equal(normalizeLedger('s', { reflectedSeq: 7 }).reflectedSeq, 7)
 })
 
 test('the compaction wrapper falls back to the summarizer when memory is empty', async () => {
@@ -1294,13 +1800,26 @@ test('the probe reports ledger contents and the rendered memory', async () => {
 
   const summary = (await call({ action: 'ledger', sessionId: 'session-probe' })).payload.result
   assert.equal(summary.kind, 'ok')
-  assert.deepEqual(summary.summary, {
+  const reported = summary.summary
+  assert.deepEqual(
+    {
+      observations: reported.observations,
+      activeObservations: reported.activeObservations,
+      reflections: reported.reflections,
+      dropped: reported.dropped,
+      observedSeq: reported.observedSeq,
+      observedCount: reported.observedCount,
+      reflectedSeq: reported.reflectedSeq,
+      updatedAt: reported.updatedAt
+    },
+    {
     observations: 1,
     activeObservations: 1,
     reflections: 0,
     dropped: 1,
+    observedSeq: undefined,
     observedCount: 0,
-    observedTokens: 0,
+    reflectedSeq: undefined,
     updatedAt: ledger.updatedAt
   })
 
@@ -1380,15 +1899,20 @@ test('the usage action reports the three clocks the widget draws', async () => {
     measure: () => ({ totalTokens: 400000 }),
     estimateMessage: (message) => Math.ceil(JSON.stringify(message).length / 4)
   }
+  const usageMessages = [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(4000) }] }]
   const agent = {
     options: {},
     session: {
       id: 'session-usage',
-      deriveMessages: () => [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(4000) }] }],
+      deriveMessages: () => usageMessages,
+      surface: { nodes: [1] },
       requestHeader: () => ({ config: { provider: 'p', model: 'm' } })
     }
   }
   ctx.agents = { get: (id) => (id === 'session-usage' ? agent : undefined) }
+  // Nothing has been observed yet, so both anchors are absent and both clocks
+  // read the whole conversation as unread-but-pending.
+  const usageLedger = await (async () => (await import('../index.js')).emptyLedger('session-usage'))()
 
   const { call } = probeCaller(ctx)
   const result = (await call({ action: 'usage', sessionId: 'session-usage' })).payload.result
@@ -1398,9 +1922,122 @@ test('the usage action reports the three clocks the widget draws', async () => {
   assert.equal(result.context.retainedTokens, 160000)
   assert.equal(result.context.percent, 50, '400k of an 800k threshold')
   assert.equal(result.compact.percent, 50)
-  assert.equal(result.reflect.percent, 0, 'an empty pool is 0% of the reflect threshold')
+  // No reflection has ever run, so the whole conversation is flow it has not
+  // reasoned over — not zero.
+  assert.equal(result.reflect.pendingTokens, result.ledger.conversationTokens)
+  assert.ok(result.reflect.percent > 0, 'the whole conversation is unreflected flow')
   assert.ok(result.observe.percent > 0, 'the backlog is measured against observeAfterTokens')
   assert.equal(result.ledger.coveragePercent, 0)
+})
+
+test('coverage is measured against the conversation, not the compaction threshold', async () => {
+  // Regression: the widget divided the ledger's read total by the compaction
+  // threshold. That answers "is the ledger big enough to stand in for the region
+  // compaction would replace" — a real question, but a different one — and it
+  // made the reading plateau in the seventies however caught up the reader was,
+  // because the threshold is a trigger line, not the size of the conversation.
+  const engine = fakeEngine(() => ({}))
+  engine.config = { thresholdRatio: 0.8, headroomTokens: 65536, retainRatio: 0.16 }
+  const ctx = fakeCtx({ compaction: engine })
+  ctx.modelInfo = { context: { contextWindow: 1000000 }, defaultMaxTokens: 0 }
+  ctx.tokenMeter = {
+    measure: () => ({ totalTokens: 613850 }),
+    // Price each message at a fixed 1000 tokens so the arithmetic is exact.
+    estimateMessage: () => 1000
+  }
+  const messages = Array.from({ length: 614 }, (_, index) => ({
+    role: 'user',
+    content: [{ type: 'text', text: `m${index}` }]
+  }))
+  const agent = {
+    options: {},
+    session: {
+      id: 'session-coverage-basis',
+      deriveMessages: () => messages,
+      requestHeader: () => ({ config: { provider: 'p', model: 'm' } })
+    }
+  }
+  ctx.agents = { get: (id) => (id === 'session-coverage-basis' ? agent : undefined) }
+  const { call, runtime } = probeCaller(ctx)
+
+  const ledger = await runtime.store.load('session-coverage-basis')
+  // Read 600 of 614 messages: nearly caught up, though the ledger sits far below
+  // the 800k compaction threshold.
+  ledger.observedCount = 600
+  ledger.observedTokens = 600000
+
+  const result = (await call({ action: 'usage', sessionId: 'session-coverage-basis' })).payload.result
+  assert.equal(result.context.thresholdTokens, 800000)
+  assert.equal(result.ledger.conversationTokens, 614000, 'the conversation is priced like the watermark')
+  assert.equal(result.ledger.coveragePercent, 98, '600k read of a 614k conversation')
+  assert.equal(result.ledger.unreadTokens, 14000)
+
+  // The threshold-based figure would have read 75%: the plateau this removes.
+  assert.notEqual(result.ledger.coveragePercent, 75)
+})
+
+test('the reflect reading is the flow the reflector is scheduled on', async () => {
+  // Regression: the widget reported the observation POOL against the reflect
+  // threshold, but the reflector is scheduled on conversation that has flowed
+  // past since the last reflection. The panel therefore sat at 100% while the
+  // real trigger was untouched — a reading the scheduler never consults, and one
+  // a reader had no way to tell apart from the real thing.
+  const engine = fakeEngine(() => ({}))
+  engine.config = { thresholdRatio: 0.8, headroomTokens: 65536, retainRatio: 0.16 }
+  const ctx = fakeCtx({ compaction: engine })
+  ctx.modelInfo = { context: { contextWindow: 1000000 }, defaultMaxTokens: 0 }
+  // One token per message, so the flow arithmetic is exact and anchor-driven.
+  ctx.tokenMeter = { measure: () => ({ totalTokens: 100000 }), estimateMessage: () => 1 }
+  const flowMessages = Array.from({ length: 300 }, (_, index) => ({
+    role: 'user',
+    content: [{ type: 'text', text: `m${index}` }]
+  }))
+  const flowSeqs = flowMessages.map((_, index) => 500 + index)
+  const agent = {
+    options: {},
+    session: {
+      id: 'session-reflect-flow',
+      deriveMessages: () => flowMessages,
+      surface: { nodes: flowSeqs },
+      requestHeader: () => ({ config: { provider: 'p', model: 'm' } })
+    }
+  }
+  ctx.agents = { get: (id) => (id === 'session-reflect-flow' ? agent : undefined) }
+  const { call, runtime } = probeCaller(ctx)
+
+  // A big pool, but nothing new since the last reflection: the flow is zero.
+  const ledger = await runtime.store.load('session-reflect-flow')
+  for (let index = 0; index < 200; index += 1) {
+    ledger.observations.push({
+      id: memoryId('observation', `r${index}`),
+      content: 'x'.repeat(400),
+      timestamp: 't',
+      relevance: 'medium',
+      tokens: 100,
+      evidence: ''
+    })
+  }
+  // Both anchors rest on the last message: the observer is caught up, and the
+  // reflector has already reasoned over everything the observer read.
+  ledger.observedSeq = flowSeqs[flowSeqs.length - 1]
+  ledger.observedCount = flowMessages.length
+  ledger.reflectedSeq = flowSeqs[flowSeqs.length - 1]
+
+  const caughtUp = (await call({ action: 'usage', sessionId: 'session-reflect-flow' })).payload.result
+  assert.ok(caughtUp.reflect.activeTokens > 20000, 'the pool is large')
+  assert.equal(caughtUp.reflect.pendingTokens, 0, 'but no conversation flowed past')
+  assert.equal(caughtUp.reflect.percent, 0, 'so the reflector is not due, and the panel says so')
+
+  // The reflection anchor falls behind the observation anchor: the reading tracks
+  // that flow rather than the pool.
+  ledger.reflectedSeq = flowSeqs[0]
+  const behind = (await call({ action: 'usage', sessionId: 'session-reflect-flow' })).payload.result
+  // 299 messages at one token each: 299 tokens of flow, which is 1% of the
+  // 20,000 threshold. The point is that it tracked the FLOW — before the fix this
+  // reading followed the observation pool and sat at 100%.
+  assert.equal(behind.reflect.pendingTokens, 299, 'the flow since the last reflection')
+  assert.equal(behind.reflect.percent, 1, '299 against a 20,000 threshold')
+  assert.ok(behind.reflect.pendingTokens !== caughtUp.reflect.activeTokens, 'and it is not the pool')
 })
 
 test('the usage action degrades to no-percentage rather than lying', async () => {
@@ -1479,6 +2116,14 @@ test('one failing activation step does not skip the others', () => {
   assert.match(runtime.stats.steps['probe route'], /no web server here/)
   assert.equal(runtime.stats.steps['recall tool'], 'ok')
   assert.equal(runtime.stats.steps['turn hook'], 'ok')
+})
+
+test('the running revision identifies itself, so a stale process is detectable', () => {
+  // A workspace bundle is evaluated once per Host process. Without this, "my
+  // edit is not live" and "my edit did not work" are the same observation.
+  const first = runtimeFor(fakeCtx())
+  assert.match(first.stats.buildId, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z·\d+b$/)
+  assert.equal(buildId(), first.stats.buildId, 'every activation reports the same source identity')
 })
 
 test('apply records each activation step outcome and the resolved config', () => {

@@ -67,26 +67,39 @@ observational-memory: active (observe ~10000, reflect ~20000 tokens)
   config:
     observeAfterTokens: 10000
     reflectAfterTokens: 20000
+    observationsPoolTargetTokens: 10000
     observationsPoolMaxTokens: 20000
     observerChunkMaxTokens: 12000
-    maxTokens: 4096
+    catchUpChunksPerPass: 1
+    callTimeoutMs: 120000
+    passTimeoutMs: 900000
+    maxTokens: 8192
     model: { provider: openrouter, model: google/gemma-4-31b-it }
     passive: false
     debugLog: false
     rootAgentsOnly: true
 ```
 
-| 设置 | 默认 | 含义 |
-|---|---|---|
-| `observeAfterTokens` | `10000` | 未观察对话的估算 token 超过它就跑 Observer |
-| `reflectAfterTokens` | `20000` | 活跃观察的估算 token 超过它就跑 Reflector |
-| `observationsPoolMaxTokens` | `20000` | 超过它才允许 post-reflection 裁剪 |
-| `observerChunkMaxTokens` | `12000` | 单次 Observer 请求最多序列化多少 token；超长积压按最旧优先分多次排空 |
-| `maxTokens` | `4096` | 每次记忆 agent 运行的输出上限 |
-| `model` | 会话模型 | 记忆 worker 的模型覆盖（建议用便宜/快的） |
-| `passive` | `false` | 关掉全部后台记忆工作；已有账本仍然会被渲染 |
-| `debugLog` | `false` | 每次记忆运行写一行 NDJSON 到 `storages/observational-memory/debug/` |
-| `rootAgentsOnly` | `true` | 只观察根 agent，跳过子代理会话 |
+默认值与原版一致（四项调度阈值逐一对齐，见「与 Pi 原版的差距」）。**注意它们不是同一种计量**：
+
+| 设置 | 默认 | 计量对象 | 含义 |
+|---|---|---|---|
+| `observeAfterTokens` | `10000` | **流量** | 自上次观察以来流过的对话超过它就跑 Observer |
+| `reflectAfterTokens` | `20000` | **流量** | 自上次反思以来流过的对话超过它就跑 Reflector |
+| `observationsPoolTargetTokens` | `10000` | 存量 | 活跃观察池超过它，Dropper 才允许裁剪（裁到这个水平为止） |
+| `observationsPoolMaxTokens` | `20000` | 存量 | 只决定**压缩渲染**是否走全量投影，**与调度无关** |
+| `observerChunkMaxTokens` | `12000` | — | 单次 Observer 请求最多序列化多少 token；超长积压按最旧优先分多次排空 |
+| `catchUpChunksPerPass` | `1` | — | 一个回合最多读几块。设为 40 可在几条消息内追平长会话的积压，追平后自动回到每回合 1 块 |
+| `callTimeoutMs` | `120000` | — | 单次记忆调用的墙钟上限。**没有它，一次挂起会永久占住会话的在飞槽位，从而静默禁用整个功能** |
+| `passTimeoutMs` | `900000` | — | 在飞槽位超过它就视为陈旧并回收，让后续回合能重新开始 |
+| `maxTokens` | `8192` | — | 每次记忆 agent 运行的输出上限。实测单次最多产出 69 条观察（约 3,900 tokens），8192 留有余量；截断会让 JSON 解析失败、该段不被覆盖 |
+| `model` | 会话模型 | — | 记忆 worker 的模型覆盖（建议用便宜/快的） |
+| `passive` | `false` | — | 关掉全部后台记忆工作；已有账本仍然会被渲染 |
+| `debugLog` | `false` | — | 每次记忆运行写一行 NDJSON 到**会话目录**下的 `observational-memory-debug.ndjson` |
+| `rootAgentsOnly` | `true` | — | 只观察根 agent，跳过子代理会话（子代理活不过一轮，且 fork 型会重复观察父会话已有的历史） |
+
+**前四项的区别是移植中最容易搞错的地方**：拿流量阈值去比存量（或反过来）不会报错，只会让某个
+agent 永远不触发或过度触发，而且从外面完全看不出来。
 
 token 全部是**估算值**，用 Harness 自己的固定密度启发式（4 字符/token），所以它和
 `ctx.tokenMeter` 对同一段文本给出的数字是一个口径。
@@ -231,11 +244,33 @@ Observer/Reflector/Dropper 三个后台 agent、覆盖水位、按 id 溯源、�
 未移植：
 
 - **branch-local 账本**（见上，受 `session.append` 限制）。
-- **覆盖档位 `none`/`partial`/`strong` 的精算**：这里只用「被 reflection 的 supportingIds 覆盖到」
-  做二值证据，没有 Pi 的确定性分档。
+- **主动触发压缩** —— 见下一节，这是最重要的一条差异。
 - **向量检索 / 附件观察 / TUI 覆盖面板**：那是 `nik1t7n` 那个分支的特性，不属于 V3 主线。
 - **visible vs full memory 的 drift**：Pi 有 `om.folded` 细节来区分「agent 看到的」和「账本真相」；
   这里压缩检查点本身就是唯一投影，没有 drift 概念。
+
+已对齐的部分（曾经有偏差，现已按原版语义实现，并有测试守着）：
+覆盖档位 `none`/`partial`/`strong` 的引用计数分档、Reflector 的**流量**口径、
+Dropper 按 **pool target** 而非 max 触发、单一 **序列锚点**（而非双累加器）。
+
+## 谁决定压缩：一个必须知道的结构性差异
+
+**Pi 自己触发压缩，这个插件不触发。**
+
+Pi 在 `agent_settled` 上自己算「自上次压缩后流过了多少源 token」，越过 `compactAfterTokens`
+（默认 **81,000**）就主动发起压缩。本插件没有这个能力：DSH 的压缩时机由
+`dsh-compaction-basic` 拥有，插件只在它的 `summarize()` 钩子里被调用——**越权触发不属于插件的职责**。
+
+后果是量级差异：
+
+| | 触发阈值 | 记忆被用上的频率 |
+|---|---|---|
+| Pi | 81,000 | 每个长会话多次 |
+| DSH（本 profile，1M 窗口） | **800,000** | **每个会话一两次** |
+
+也就是说：**在 DSH 上这套记忆的生效频率远低于 Pi**。这不是缺陷，是边界——但它决定了这个插件的
+实际价值判断。如果希望它更频繁地生效，那是 `compaction-basic` 的 `thresholdRatio` 该调，
+不是这个插件该做的事。
 
 ## 诊断路由（也是验证手段）
 
@@ -308,15 +343,49 @@ Cordis 的上下文是 Proxy：**访问一个没有写进 `inject` 的服务属�
 
 ## 已知风险
 
-- **`agent/turn-stopping` 是否会真的每回合触发，尚未实证。** 下一次实跑要看的正是这一条：
-  `status.turnStoppingSeen` 是否随回合增长。如果不能触发，就改走 `agent/status` 的 idle 路径。
+- **`agent/turn-stopping` 已实证每回合触发**（`turnStoppingSeen` / `passesScheduled` 随回合增长，
+  记忆流程 `completed` 正常）。这条曾经的未知项已经关闭。
 - **代码改动必须重启 Harness 才生效。** 工作区 bundle 是 `link:` 依赖，ESM 按 URL 缓存模块；
   profile 里 disable/enable 一个 bundle 不会重新执行模块体，所以运行中的进程会一直用旧代码。
 - **观察者错误会被加固**。和 Pi 一样，observations 会被提升为 reflections，再作为裁剪证据 ——
   一个被误读或从工具输出带进来的错误事实会变得持久且自信。`recall` 是对策（能回看原文），但依赖
   模型主动去核验。这是这套机制固有的风险，不是移植缺陷。
+- **「静默丢失记忆」是本项目最高频的一类缺陷，一共犯过四次。** 每一次都是某个环节
+  *看起来*成功了，实际上把该留的东西丢掉了，而且从界面和日志上都看不出来：
+
+  | 缺陷 | 后果 | 现在由什么守住 |
+  |---|---|---|
+  | 省略按 80 字符估算（实际 231） | 为省 24% 的长度，**砍掉 316 条里的 315 条** | 按实际平均行长计算 + 两条测试 |
+  | 覆盖档位二值化 | 只被 1 条反思支撑的观察被标 `strong` → **诱导删除** | 引用计数分三档 + 测试 |
+  | Reflector 锚点无条件推进 | 空结果也算「已反思」→ 那段对话**永久不再反思** | 只在有产出时推进 + 测试 |
+  | 面板用池存量当反思时钟 | 显示 100% 而真实触发条件未动 | 改用流量口径 + 测试 |
+
+  共同点：**都是「用一个为某种计量设计的数字去衡量另一种东西」**，以及**把部分当成了整体**。
+  新增阈值或计量时，先问「这个数字量的是什么、和谁比、口径是否一致」。
+
 - **每回合一次后台模型调用**是真实成本。`observeAfterTokens` 默认 10k，短会话不会触发；但一个
   长会话会持续产生 worker 调用，建议给 `model` 配一个便宜的 worker。
+
+## 验证状态（截至最后一次实测）
+
+| 部分 | 状态 | 证据 |
+|---|---|---|
+| Observer 记录观察 | ✅ 实证 | 432 条观察落在会话目录，含单轮 21 条 |
+| Reflector 产出反思 | ✅ 实证 | 37 条；单轮 12 条新反思 |
+| Dropper 按预算裁剪 | ✅ 实证 | 日志 `dropped 49 … 49 allowed towards a 10000-token target` |
+| 序列锚点水位 | ✅ 实证 | `observedSeq` 建立，旧的漂移计数被推导值替换 |
+| 覆盖率与面板读数 | ✅ 实证 | 100% 覆盖、未读 1,287，两者自洽 |
+| `agent/turn-stopping` 触发 | ✅ 实证 | `turnStoppingSeen`/`passesScheduled` 随回合增长 |
+| `recall` 工具、`/om-*` 命令 | ✅ 注册成功 | 探针与命令列表 |
+| 状态栏 UI（环/字号/颜色/tooltip） | ✅ 目视确认 | 与自带上下文表一致 |
+| **压缩采用渲染** | ❌ **未验证** | 需要上下文达到压缩阈值（本 profile 为 800,000） |
+
+**最后一行是核心功能，也是唯一未实证的部分。** 代码路径有测试覆盖，闸门的两个条件
+（账本覆盖 ≥ 被替换区域、渲染 < 被替换区域）在最后一次检查时都成立，但**真实的压缩从未发生过**：
+本 profile 的阈值是模型窗口的 80%（1M 窗口 → 800,000），而会话一直没到过。
+
+换句话说：即使一切按设计工作，**这套记忆在 DSH 上每个会话只会被用上一两次**（见「谁决定压缩」一节）。
+在它被真实触发之前，请把「压缩会采用记忆」当作**设计意图**，而不是已验证的行为。
 
 ## 测试
 
@@ -324,7 +393,7 @@ Cordis 的上下文是 Proxy：**访问一个没有写进 `inject` 的服务属�
 node --test test/om.test.mjs
 ```
 
-53 项，用假 Cordis context + 临时 `DSH_HOME` 驱动真实模块，覆盖配置解析、id 确定性、
+98 项，用假 Cordis context + 临时 `DSH_HOME` 驱动真实模块，覆盖配置解析、id 确定性、
 账本归一化与磁盘往返、**删掉会话目录记忆随之消失**、**写入绝不制造幽灵会话目录**、
 目录按工作区键发现、原子写无残留、损坏账本降级、渲染排序与截断、消息序列化、
 分块预算、JSON 容错解析、Observer 的覆盖推进语义（含不可解析时**不推进**、surface 缩小后重置）、

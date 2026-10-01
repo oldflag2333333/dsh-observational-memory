@@ -1,7 +1,11 @@
 # Observational-memory bundle: one Host row.
+#
 # The plugin is dependency-free (a workspace bundle has no node_modules), so it
-# reaches the harness through runtime services only: ctx.llm, ctx.tools,
-# ctx.commands, ctx.tokenMeter and the live ctx.compaction engine.
+# reaches the harness through runtime services only. Note the accessor: Cordis
+# throws on property access to a service the plugin did not declare in `inject`
+# ("cannot get property llm without inject"), so everything except the declared
+# `tools`/`commands` is reached with `ctx.get(name)` — including `llm`, the live
+# `compaction` engine, `tokenMeter`, `agents` and `agentPresets`.
 - insert:
     - id: observational-memory
       name: '@local/dsh-observational-memory'

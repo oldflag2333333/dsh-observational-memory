@@ -39,8 +39,10 @@
 
 import { createHash } from 'node:crypto'
 import { appendFile, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /** Cordis plugin name. */
 export const name = 'observational-memory'
@@ -65,10 +67,42 @@ const DEFAULTS = Object.freeze({
   reflectAfterTokens: 20000,
   /** Estimated tokens of active observations that triggers pruning after a reflection. */
   observationsPoolMaxTokens: 20000,
+  /**
+   * The level the dropper trims the ACTIVE pool down to. Distinct from the
+   * maximum, which only decides whether compaction renders a full fold: using
+   * the maximum as the pruning trigger makes pruning late by design, because it
+   * is twice this.
+   */
+  observationsPoolTargetTokens: 10000,
   /** Maximum estimated tokens serialized into one Observer request. */
   observerChunkMaxTokens: 12000,
+  /**
+   * Observer chunks one memory pass may read. Above 1 the pass drains a backlog
+   * instead of advancing one chunk per turn, which is the difference between
+   * converging on a long session and never quite catching up. The cap exists so
+   * a single turn cannot spend an unbounded number of model calls.
+   */
+  catchUpChunksPerPass: 1,
+  /**
+   * Wall-clock ceiling for one memory-agent call. A hung call holds the
+   * per-session in-flight slot, and because the scheduler skips a session that
+   * already has a run, one hang silently disables memory for the rest of the
+   * process lifetime.
+   */
+  callTimeoutMs: 120000,
+  /** How long an in-flight run may last before the slot is reclaimable. */
+  passTimeoutMs: 900000,
   /** Output-token ceiling requested for each memory-agent run. */
-  maxTokens: 4096,
+  /**
+   * Output ceiling for one memory-agent call.
+   *
+   * Sized from observation: entries average ~57 tokens, a typical observer run
+   * returns ~15 of them, and the largest observed run returned 69 (~3,900
+   * tokens). 4,096 sat just above that worst case, so a busier run would be
+   * truncated — `extractJsonArray` then fails and the chunk is left uncovered.
+   * That is safe (the range is retried) but it wastes the call.
+   */
+  maxTokens: 8192,
   /** Optional memory-worker model override: `{ provider, model }`. */
   model: undefined,
   /** Disable all background memory work; an existing ledger still renders. */
@@ -109,7 +143,14 @@ export function resolveConfig(raw) {
     observeAfterTokens: positive(input.observeAfterTokens, DEFAULTS.observeAfterTokens),
     reflectAfterTokens: positive(input.reflectAfterTokens, DEFAULTS.reflectAfterTokens),
     observationsPoolMaxTokens: positive(input.observationsPoolMaxTokens, DEFAULTS.observationsPoolMaxTokens),
+    observationsPoolTargetTokens: positive(
+      input.observationsPoolTargetTokens,
+      Math.floor(positive(input.observationsPoolMaxTokens, DEFAULTS.observationsPoolMaxTokens) / 2)
+    ),
     observerChunkMaxTokens: positive(input.observerChunkMaxTokens, DEFAULTS.observerChunkMaxTokens),
+    catchUpChunksPerPass: positive(input.catchUpChunksPerPass, DEFAULTS.catchUpChunksPerPass),
+    callTimeoutMs: positive(input.callTimeoutMs, DEFAULTS.callTimeoutMs),
+    passTimeoutMs: positive(input.passTimeoutMs, DEFAULTS.passTimeoutMs),
     maxTokens: positive(input.maxTokens, DEFAULTS.maxTokens),
     model: hasModel ? { provider: model.provider, model: model.model } : undefined,
     passive: input.passive === true,
@@ -210,15 +251,21 @@ export function emptyLedger(sessionId) {
     observations: [],
     reflections: [],
     dropped: [],
+    /**
+     * The observation anchor: the surface sequence of the last message the
+     * observer has read. This is the only persisted watermark; every token figure
+     * is derived from it by `conversationView`. See that function for why an
+     * identity is used instead of a count or a running total.
+     */
+    observedSeq: undefined,
+    /** Count behind `observedSeq`, cached for recovery when sequences are unavailable. */
     observedCount: 0,
     /**
-     * Estimated tokens of conversation the observer has ever read. Monotonic:
-     * observations are never deleted (drops are tombstones), so this is the size
-     * of the history the ledger can actually describe. It is what licenses the
-     * deterministic render — see `coversShadowedRegion`.
+     * The reflection anchor, in the same currency: surface sequence of the last
+     * message the reflector reasoned over. The reflector's clock is the
+     * conversation that has flowed past this point.
      */
-    observedTokens: 0,
-    reflectedObservationTokens: 0,
+    reflectedSeq: undefined,
     updatedAt: new Date().toISOString()
   }
 }
@@ -257,12 +304,19 @@ export function normalizeLedger(sessionId, parsed) {
     observations,
     reflections,
     dropped: list(parsed.dropped).filter((id) => typeof id === 'string'),
+    observedSeq: isSeq(parsed.observedSeq) ? parsed.observedSeq : undefined,
     observedCount: Number.isInteger(parsed.observedCount) && parsed.observedCount >= 0 ? parsed.observedCount : 0,
-    observedTokens: Number.isFinite(parsed.observedTokens) && parsed.observedTokens >= 0 ? parsed.observedTokens : 0,
-    reflectedObservationTokens: Number.isFinite(parsed.reflectedObservationTokens)
-      ? parsed.reflectedObservationTokens
-      : 0
+    reflectedSeq: isSeq(parsed.reflectedSeq) ? parsed.reflectedSeq : undefined
   }
+}
+
+/**
+ * Whether a restored value is a usable surface sequence.
+ * @param value - the parsed value.
+ * @returns whether it is a non-negative safe integer.
+ */
+function isSeq(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
 
 /**
@@ -414,7 +468,95 @@ export function activeObservations(ledger) {
  * @returns token sum.
  */
 export function activeObservationTokens(ledger) {
-  return activeObservations(ledger).reduce((total, observation) => total + observation.tokens, 0)
+  return activeObservations(ledger).reduce((total, observation) => total + observationLineTokens(observation), 0)
+}
+
+/**
+ * Price one observation the way the pool budgets count it: the whole rendered
+ * line, not the bare content.
+ *
+ * The pool budget caps how much observation text gets re-rendered into future
+ * contexts, and every line carries its id, timestamp and relevance alongside the
+ * content. Pricing only the content understates the pool by the metadata
+ * overhead on every entry — the same class of measurement error as the elision
+ * bug, and it would make the dropper run late.
+ * @param observation - the observation to price.
+ * @returns estimated tokens of its rendered line.
+ */
+export function observationLineTokens(observation) {
+  const line = `[${observation.id}] ${observation.timestamp} [${observation.relevance}] ${observation.content}`
+  return estimateTokens(line)
+}
+
+/**
+ * How well each active observation is covered by the current reflections.
+ *
+ * The tier is the NUMBER of reflections citing an observation, not merely whether
+ * one does: one citation is `partial`, two or more is `strong`. Collapsing that to
+ * a boolean would label a barely-covered observation `strong` — the strongest
+ * signal the dropper gets — and invite it to prune something the reflections do
+ * not actually preserve.
+ * @param observations - active observations.
+ * @param reflections - current reflections.
+ * @returns observation id -> tier.
+ */
+export function reflectionCoverageMap(observations, reflections) {
+  const counts = new Map()
+  for (const reflection of reflections) {
+    // A reflection citing the same observation twice is one piece of evidence.
+    for (const id of new Set(reflection.supportingIds)) {
+      counts.set(id, (counts.get(id) ?? 0) + 1)
+    }
+  }
+  return new Map(
+    observations.map((observation) => {
+      const count = counts.get(observation.id) ?? 0
+      const tier = count <= 0 ? 'none' : count === 1 ? 'partial' : 'strong'
+      return [observation.id, tier]
+    })
+  )
+}
+
+/**
+ * Active-pool measurements behind the dropper's readiness test.
+ *
+ * Ported from the original's `observationPoolMetrics`: `ready` requires the pool
+ * to be over target AND at least one drop to be permitted, so an empty or
+ * exactly-on-target pool is never pruned. `maxDropsAllowed` is derived from the
+ * pool's own average line size rather than a constant, so it scales with however
+ * verbose this session's observations actually are.
+ * @param observations - active observations.
+ * @param targetTokens - the pool level to trim toward.
+ * @returns the metrics.
+ */
+export function observationPoolMetrics(observations, targetTokens) {
+  const count = observations.length
+  const observationTokens = observations.reduce((sum, item) => sum + observationLineTokens(item), 0)
+  // A target must be a positive budget. Zero (or a non-finite value) is not
+  // "trim everything": it makes every non-empty pool trivially "over target",
+  // which would hand the dropper a licence to empty the pool on a
+  // misconfiguration. Treat it as a disabled budget instead.
+  const validTarget = Number.isFinite(targetTokens) && targetTokens > 0
+  const tokensOverTarget = validTarget ? Math.max(0, observationTokens - targetTokens) : 0
+
+  let maxDropsAllowed = 0
+  if (count > 0 && observationTokens > 0 && validTarget && tokensOverTarget > 0) {
+    const average = observationTokens / count
+    if (average > 0) {
+      maxDropsAllowed = Math.min(count, Math.max(1, Math.ceil(tokensOverTarget / average)))
+    }
+  }
+
+  return {
+    observationTokens,
+    targetTokens,
+    tokensOverTarget,
+    fullness: validTarget ? observationTokens / targetTokens : 0,
+    activeObservationCount: count,
+    maxDropsAllowed,
+    overTarget: validTarget && observationTokens > targetTokens,
+    ready: validTarget && observationTokens > targetTokens && maxDropsAllowed > 0
+  }
 }
 
 /**
@@ -455,7 +597,14 @@ export function renderMemory(ledger) {
     if (kept.length > 0) {
       lines.push('', '## Observations')
       if (elided > 0) {
-        lines.push(`[${elided} older observation(s) elided to stay within the memory budget; recall any id you still hold]`)
+        // State the omission plainly and do NOT imply the reader can recall what
+        // it was never given: an elided observation's id never appeared in the
+        // text, so "recall any id you still hold" would advertise a route the
+        // reader has no way to take. The entries survive in the ledger, but
+        // reaching them needs an id from somewhere else.
+        lines.push(
+          `[${elided} older observation(s) omitted from this checkpoint to stay within its budget; they remain in the session ledger but are not listed here]`
+        )
       }
       for (const observation of kept) {
         lines.push(`[${observation.id}] ${observation.timestamp} [${observation.relevance}] ${observation.content}`)
@@ -468,12 +617,21 @@ export function renderMemory(ledger) {
   // Truncation would silently discard the newest — and most relevant — memory,
   // which is the same "looks complete but is not" failure the coverage gate
   // exists to prevent. Elision is stated in the text so the reader can tell.
+  //
+  // The drop is sized from the observations actually present, not from a guessed
+  // average length. A fixed estimate is wrong by whatever factor the real
+  // content differs by, and here it was wrong by ~3x: the first version assumed
+  // 80 characters per observation, the ledger averaged 231, so a single
+  // iteration discarded 315 of 316 observations to shed 24% of the length. That
+  // is a catastrophic loss presented as a bookkeeping detail, and nothing in the
+  // rendered text let a reader notice it.
   let kept = observations
   let elided = 0
   let rendered = compose(kept, elided)
   while (rendered.length > RENDER_MAX_CHARS && kept.length > 1) {
     const over = rendered.length - RENDER_MAX_CHARS
-    const drop = Math.min(kept.length - 1, Math.max(1, Math.ceil(over / 80)))
+    const average = rendered.length / kept.length
+    const drop = Math.min(kept.length - 1, Math.max(1, Math.ceil(over / average)))
     kept = kept.slice(drop)
     elided += drop
     rendered = compose(kept, elided)
@@ -533,6 +691,94 @@ export function serializeMessages(messages) {
  */
 export function estimateMessages(messages) {
   return estimateTokens(serializeMessages(messages))
+}
+
+/**
+ * Resolve the one watermark that describes how much conversation the ledger has
+ * read: a `SessionSeq` anchor into the current surface.
+ *
+ * Modelled on the original's `coversUpToId`. The anchor is an identity, not a
+ * count and not a token total, and everything else is derived from it on demand:
+ *
+ * - **A count drifts.** A position in a list means something different after the
+ *   list changes, so compaction silently repoints it. This is not hypothetical:
+ *   accumulating a message count and a token total as two independent
+ *   watermarks let them disagree, and the panel read "15,695 unread" while the
+ *   observer read "nothing to read" from the same ledger.
+ * - **A token total drifts too.** It can only go up, so a compaction that removes
+ *   the conversation behind it leaves the ledger claiming coverage of history
+ *   that no longer exists.
+ * - **An identity is immune.** After a compaction the anchor's sequence is no
+ *   longer in the surface, so the covered prefix resolves to nothing and the
+ *   surviving history is read again — which is the correct answer, reached
+ *   without a reset heuristic.
+ *
+ * @param runtime - the runtime.
+ * @param agent - the agent whose session is read.
+ * @param ledger - the session ledger.
+ * @param anchor - the sequence to measure past. Defaults to the observation
+ *   anchor; the reflector passes its own, so one function serves both clocks
+ *   instead of each maintaining a private running total.
+ * @returns the surface sequences, the covered prefix, the pending suffix, and
+ *   their token prices.
+ */
+export function conversationView(runtime, agent, ledger, anchor) {
+  // `anchor === undefined` means "use the observation anchor"; `anchor === null`
+  // means "this clock has no anchor yet, so nothing has been covered on it". The
+  // two must be distinguishable, and a default parameter cannot express that:
+  // passing `ledger.reflectedSeq` when it is undefined silently falls back to the
+  // observation anchor, which reported the reflector as fully caught up and
+  // starved it of every run.
+  const effectiveAnchor = anchor === undefined ? ledger.observedSeq : anchor
+  const unanchored = anchor === null
+  const messages = agent.session.deriveMessages()
+  let seqs = []
+  try {
+    const nodes = agent.session.surface?.nodes
+    if (Array.isArray(nodes)) seqs = nodes
+  } catch {
+    /* a surface that cannot be read leaves sequences unknown */
+  }
+
+  // Sequences and messages are parallel projections of the same surface. When
+  // only messages are available the view still works, it just cannot persist an
+  // identity — `observedSeq` stays undefined and the next run recovers by
+  // count, which is the weaker guarantee this replaces.
+  const aligned = seqs.length === messages.length
+
+  let coveredCount = 0
+  if (unanchored) {
+    // Nothing has been covered on this clock: the whole conversation is pending.
+    // The reflector relies on this — before its first run every message is flow
+    // it has not reasoned over, and treating it as caught up would starve it.
+    coveredCount = 0
+  } else if (effectiveAnchor !== undefined && aligned) {
+    const index = seqs.indexOf(effectiveAnchor)
+    // A resolvable anchor covers through itself. An anchor the surface does not
+    // contain means the messages behind it were replaced — a compaction — so the
+    // surviving history is read again. Both answers come from the identity alone;
+    // no count is consulted, because a count is exactly what cannot survive a
+    // surface replacement.
+    coveredCount = index >= 0 ? index + 1 : 0
+  } else if (effectiveAnchor === undefined && Number.isInteger(ledger.observedCount) && ledger.observedCount > 0) {
+    // No anchor yet: a ledger written before anchors existed, or a surface whose
+    // sequences cannot be read. The count is the only signal available, clamped so
+    // a stale one cannot claim more than exists.
+    coveredCount = Math.min(ledger.observedCount, messages.length)
+  }
+
+  const covered = messages.slice(0, coveredCount)
+  const pending = messages.slice(coveredCount)
+  return {
+    seqs,
+    aligned,
+    coveredCount,
+    covered,
+    pending,
+    coveredTokens: estimateShadowedTokens(runtime, { messages: covered }),
+    pendingTokens: estimateShadowedTokens(runtime, { messages: pending }),
+    conversationTokens: estimateShadowedTokens(runtime, { messages })
+  }
 }
 
 /**
@@ -608,9 +854,13 @@ export function estimateShadowedTokens(runtime, input) {
  * @param shadowedTokens - estimated tokens the compaction will replace.
  * @returns whether the render may stand in for that region.
  */
-export function coversShadowedRegion(ledger, shadowedTokens) {
+export function coversShadowedRegion(ledger, shadowedTokens, coveredTokens) {
   if (!Number.isFinite(shadowedTokens) || shadowedTokens <= 0) return false
-  return ledger.observedTokens >= shadowedTokens
+  // `coveredTokens` is derived from the anchor by `conversationView`. Without it
+  // the ledger cannot answer, and refusing is the safe direction: the caller then
+  // falls back to the shipped summarizer.
+  if (!Number.isFinite(coveredTokens)) return false
+  return coveredTokens >= shadowedTokens
 }
 
 /**
@@ -705,6 +955,27 @@ export function extractJsonArray(text) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Identity of the running code: the source's load time and size.
+ *
+ * A workspace bundle is evaluated once per Host process, so there is no module
+ * reload to observe and no other way for a caller to tell which revision is
+ * live. Comparing this against the file's mtime is what distinguishes "the edit
+ * is not in the running process" from "the edit did not work".
+ * @returns a short identity string, or `unknown`.
+ */
+export function buildId() {
+  try {
+    const url = import.meta.url
+    if (typeof url !== 'string' || !url.startsWith('file:')) return 'unknown'
+    const path = fileURLToPath(url)
+    const info = statSync(path)
+    return `${info.mtime.toISOString()}·${info.size}b`
+  } catch {
+    return 'unknown'
+  }
+}
+
+/**
  * Per-activation state. Everything a helper needs is passed explicitly: a Cordis
  * context is a service proxy, not a place to hang plugin-private fields.
  * @param ctx - the plugin context.
@@ -726,6 +997,15 @@ export function createRuntime(ctx, config) {
      */
     stats: {
       activatedAt: new Date().toISOString(),
+      /**
+       * Identity of the code actually running.
+       *
+       * A workspace bundle is a `link:` dependency, so the module body is
+       * evaluated once per Host process: "did my edit take effect" can only be
+       * answered by the running process, and a stale `activatedAt` compared
+       * against the file's mtime answers it.
+       */
+      buildId: buildId(),
       /** @type {Record<string, string>} step name -> `ok` or the failure text */
       steps: {},
       turnStoppingSeen: 0,
@@ -733,6 +1013,12 @@ export function createRuntime(ctx, config) {
       passesStarted: 0,
       passesCompleted: 0,
       passesFailed: 0,
+      /** In-flight slots reclaimed because their run never finished. */
+      stalePassesReclaimed: 0,
+      /** Observer chunks read beyond the first, i.e. backlog drained by catch-up. */
+      catchUpChunks: 0,
+      /** Whether the last pass hit the catch-up cap with backlog still remaining. */
+      catchUpActive: false,
       /** Compactions answered from the ledger with no model call. */
       rendersServed: 0,
       /** Compactions that fell through to the shipped summarizer. */
@@ -857,19 +1143,37 @@ async function callMemoryModel(runtime, agent, system, prompt, signal) {
   // `compaction`, `agents` and `sessionPersistence`.
   const llm = runtime.ctx.get('llm')
   if (typeof llm?.stream !== 'function') throw new Error('the llm service is not mounted')
+
+  // Every memory call is bounded. A worker that hangs would otherwise hold the
+  // per-session in-flight slot forever, and since the scheduler skips a session
+  // that already has a run, one hung call silently disables memory for the rest
+  // of the process lifetime. A timeout turns that into an ordinary failed pass.
+  const timeoutMs = runtime.config.callTimeoutMs
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error(`memory call exceeded ${timeoutMs}ms`)), timeoutMs)
+  const signals = signal === undefined ? [controller.signal] : [signal, controller.signal]
+  const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any(signals) : controller.signal
+
   let text = ''
   let finish
-  for await (const chunk of llm.stream({
-    provider: target.provider,
-    model: target.model,
-    system,
-    messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
-    maxTokens: runtime.config.maxTokens,
-    sessionId: agent.session.id,
-    ...(signal === undefined ? {} : { signal })
-  })) {
-    if (chunk?.type === 'text-delta') text += chunk.text ?? ''
-    else if (chunk?.type === 'finish') finish = chunk.reason?.kind
+  try {
+    for await (const chunk of llm.stream({
+      provider: target.provider,
+      model: target.model,
+      system,
+      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+      maxTokens: runtime.config.maxTokens,
+      sessionId: agent.session.id,
+      signal: combined
+    })) {
+      if (chunk?.type === 'text-delta') text += chunk.text ?? ''
+      else if (chunk?.type === 'finish') finish = chunk.reason?.kind
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+  if (controller.signal.aborted && signal?.aborted !== true) {
+    throw new Error(`memory call timed out after ${timeoutMs}ms`)
   }
   if (typeof finish === 'string' && finish !== 'stop' && text.trim().length === 0) {
     throw new Error(`memory run finished without usable output (${finish})`)
@@ -909,35 +1213,11 @@ async function debugRecord(runtime, sessionId, record) {
  */
 export async function runObserver(runtime, agent, ledger, signal) {
   const config = runtime.config
-  const messages = agent.session.deriveMessages()
-  if (messages.length < ledger.observedCount) ledger.observedCount = 0
+  const view = conversationView(runtime, agent, ledger)
+  if (view.pending.length === 0) return null
+  if (view.pendingTokens < config.observeAfterTokens) return null
 
-  // Keep the token watermark honest: never below the price of the messages the
-  // ledger claims to have read, priced with the same meter the coverage gate
-  // compares against.
-  //
-  // This self-heals two real cases. A ledger written before `observedTokens`
-  // existed reads as 0 and would deadlock the gate forever; a ledger written by a
-  // version that only accumulated *new* chunks under-reports everything read
-  // before it. Both make the gate refuse memory the ledger genuinely holds, so the
-  // feature stays dormant even once coverage is complete.
-  //
-  // It only ever RAISES the watermark, so it can never make the gate more
-  // permissive than the ledger's real coverage.
-  const claimedCoverage =
-    ledger.observedCount > 0
-      ? estimateShadowedTokens(runtime, { messages: messages.slice(0, ledger.observedCount) })
-      : 0
-  if (claimedCoverage > ledger.observedTokens) {
-    ledger.observedTokens = claimedCoverage
-    await runtime.store.save(agent.session.id)
-  }
-
-  const pending = messages.slice(ledger.observedCount)
-  if (pending.length === 0) return null
-  if (estimateMessages(pending) < config.observeAfterTokens) return null
-
-  const chunk = takeOldestChunk(pending, config.observerChunkMaxTokens)
+  const chunk = takeOldestChunk(view.pending, config.observerChunkMaxTokens)
   const transcript = serializeMessages(chunk)
   const raw = await callMemoryModel(
     runtime,
@@ -975,12 +1255,13 @@ export async function runObserver(runtime, agent, ledger, signal) {
     recorded += 1
   }
 
-  ledger.observedCount += chunk.length
-  // Coverage is measured in tokens, not messages, so it can be compared with the
-  // size of the region a compaction wants to replace. Priced with the engine
-  // meter where available; the local serializer under-counts tool-heavy chunks,
-  // which only makes this test more conservative.
-  ledger.observedTokens += estimateShadowedTokens(runtime, { messages: chunk })
+  // Advance the single anchor to the last message this chunk covered, and record
+  // its position within the covered prefix. Nothing else is accumulated: every
+  // token figure is recomputed from the anchor, so a compaction that removes the
+  // covered messages cannot leave the ledger believing it has read history that
+  // no longer exists.
+  ledger.observedSeq = view.seqs[view.coveredCount + chunk.length - 1]
+  ledger.observedCount = view.coveredCount + chunk.length
   await runtime.store.save(agent.session.id)
   await debugRecord(runtime, agent.session.id, {
     run: 'observer',
@@ -999,8 +1280,21 @@ export async function runReflector(runtime, agent, ledger, signal) {
   const config = runtime.config
   const observations = activeObservations(ledger)
   if (observations.length === 0) return null
-  const tokens = activeObservationTokens(ledger)
-  if (tokens < config.reflectAfterTokens) return null
+
+  // Measured as raw conversation that has flowed past since the last reflection,
+  // matching `rawTokensSinceReflectionCoverage` in the original. This is a FLOW
+  // measure, not the size of the observation pool: observations are a condensed
+  // record, so a pool holding 316 of them represents 560k tokens of
+  // conversation while itself weighing ~18k. Comparing that pool against a
+  // threshold meant for flow is a category error, and it is why reflections
+  // never triggered here: the pool could not reach 20k, so the reflector was
+  // dead code no matter how much the session grew.
+  // The reflector's clock is the conversation that has flowed past its own
+  // anchor, derived on demand. A separate running total would drift against the
+  // observation anchor exactly as the two watermark counters did.
+  const reflectedView = conversationView(runtime, agent, ledger, ledger.reflectedSeq ?? null)
+  const sinceReflection = reflectedView.pendingTokens
+  if (sinceReflection < config.reflectAfterTokens) return null
 
   const listing = observations
     .map((observation) => `[${observation.id}] (${observation.relevance}) ${observation.content}`)
@@ -1019,11 +1313,14 @@ export async function runReflector(runtime, agent, ledger, signal) {
   const parsed = extractJsonArray(raw)
   if (parsed === null) {
     await debugRecord(runtime, agent.session.id, { run: 'reflector', outcome: 'unparseable' })
-    return 'reflector: unparseable output'
+    // The anchor deliberately does not move: this conversation has not been
+    // reflected on, and marking it as if it had would retire it permanently.
+    return 'reflector: unparseable output, coverage left unchanged'
   }
 
   const known = new Set(observations.map((observation) => observation.id))
   let recorded = 0
+  let restated = 0
   for (const item of parsed) {
     if (item === null || typeof item !== 'object') continue
     const content = typeof item.content === 'string' ? item.content.trim().replace(/\s+/g, ' ') : ''
@@ -1037,16 +1334,33 @@ export async function runReflector(runtime, agent, ledger, signal) {
     const previous = ledger.reflections.find((reflection) => reflection.id === id)
     if (previous !== undefined) {
       previous.supportingIds = supportingIds
+      restated += 1
       continue
     }
     ledger.reflections.push({ id, content, supportingIds, tokens: estimateTokens(content) })
     recorded += 1
   }
 
-  ledger.reflectedObservationTokens = tokens
+  // The reflection anchor advances only when the run actually distilled
+  // something. An empty or unusable result means this conversation has not been
+  // reflected on, and advancing regardless would retire it forever: the clock
+  // would read zero however much unreflected history sat behind it. The original
+  // enforces the same rule structurally — its coverage marker is written only for
+  // a non-empty reflection set, and an empty set does not count as a marker at
+  // all.
+  //
+  // Restating an existing reflection still counts as progress: the run did reason
+  // over the conversation, and its answer was "these still hold" — a conclusion,
+  // not a failure.
+  if (recorded + restated === 0) {
+    await debugRecord(runtime, agent.session.id, { run: 'reflector', outcome: 'empty' })
+    return 'reflector: no durable conclusions, coverage left unchanged'
+  }
+
+  ledger.reflectedSeq = ledger.observedSeq
   await runtime.store.save(agent.session.id)
-  await debugRecord(runtime, agent.session.id, { run: 'reflector', outcome: 'ok', recorded })
-  return `reflector: recorded ${recorded} reflection(s)`
+  await debugRecord(runtime, agent.session.id, { run: 'reflector', outcome: 'ok', recorded, restated })
+  return `reflector: recorded ${recorded} new reflection(s), restated ${restated}`
 }
 
 /**
@@ -1062,17 +1376,24 @@ export async function runDropper(runtime, agent, ledger, signal) {
   const config = runtime.config
   const observations = activeObservations(ledger)
   if (observations.length === 0) return null
-  if (activeObservationTokens(ledger) <= config.observationsPoolMaxTokens) return null
 
-  const covered = new Set()
-  for (const reflection of ledger.reflections) {
-    for (const id of reflection.supportingIds) covered.add(id)
-  }
+  // The dropper's trigger is the pool TARGET, not the pool maximum. In the
+  // original these are two different budgets: `observationsPoolMaxTokens` only
+  // decides whether compaction renders a full fold, while
+  // `observationsPoolTargetTokens` is the level the dropper trims the active pool
+  // down to. Using the maximum as the trigger made pruning late by design, since
+  // it is twice the target.
+  const pool = observationPoolMetrics(observations, config.observationsPoolTargetTokens)
+  if (!pool.ready) return null
+
+  const coverage = reflectionCoverageMap(observations, ledger.reflections)
   const listing = observations
-    .map((observation) => {
-      const tier = covered.has(observation.id) ? 'strong' : 'none'
-      return `[${observation.id}] (${observation.relevance}, coverage: ${tier}) ${observation.content}`
-    })
+    .map(
+      (observation) =>
+        `[${observation.id}] (${observation.relevance}, coverage: ${
+          coverage.get(observation.id) ?? 'none'
+        }) ${observation.content}`
+    )
     .join('\n')
   const raw = await callMemoryModel(runtime, agent, DROPPER_SYSTEM, `Active observations:\n${listing}`, signal)
   const parsed = extractJsonArray(raw)
@@ -1084,6 +1405,12 @@ export async function runDropper(runtime, agent, ledger, signal) {
   const droppable = new Set(observations.map((observation) => observation.id))
   const dropped = []
   for (const value of parsed) {
+    // The budget, not the model, bounds the drop. The original derives
+    // `maxDropsAllowed` from the pool's own average line size so one run can
+    // never gut the pool; a model that returns every id it was shown is
+    // over-reaching, and honouring that would discard memory the budget never
+    // asked to shed.
+    if (dropped.length >= pool.maxDropsAllowed) break
     const id =
       typeof value === 'string' ? value : value !== null && typeof value === 'object' ? value.id : undefined
     if (typeof id !== 'string' || !droppable.has(id) || ledger.dropped.includes(id)) continue
@@ -1092,7 +1419,7 @@ export async function runDropper(runtime, agent, ledger, signal) {
   }
   if (dropped.length > 0) await runtime.store.save(agent.session.id)
   await debugRecord(runtime, agent.session.id, { run: 'dropper', outcome: 'ok', dropped: dropped.length })
-  return `dropper: dropped ${dropped.length} observation(s) from active memory`
+  return `dropper: dropped ${dropped.length} observation(s) from active memory (${pool.maxDropsAllowed} allowed towards a ${config.observationsPoolTargetTokens}-token target)`
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,8 +1441,37 @@ export async function runMemoryPass(runtime, agent, signal) {
     const sessionId = agent.session.id
     const ledger = await runtime.store.load(sessionId)
     const outcomes = []
-    const observer = await runObserver(runtime, agent, ledger, signal)
-    if (observer !== null) outcomes.push(observer)
+
+    // Drain the observer backlog within one pass when catch-up is armed.
+    //
+    // The observer reads a fixed-size chunk per run, so a session that began
+    // being observed mid-life — or that ran while the observer was failing — is
+    // covered at roughly one chunk per turn. On a long session that never
+    // converges, because the conversation grows faster than the backlog drains.
+    // Catch-up loops until nothing is due, bounded so one pass cannot spend an
+    // unbounded number of model calls.
+    const limit = Math.max(1, runtime.config.catchUpChunksPerPass)
+    let chunks = 0
+    let more = false
+    while (chunks < limit) {
+      const observer = await runObserver(runtime, agent, ledger, signal)
+      if (observer === null) break
+      outcomes.push(observer)
+      chunks += 1
+      if (chunks >= limit) {
+        // The cap counts as "active" only when something is genuinely left: with
+        // a cap of 1 and a single chunk pending, the pass converged and must say
+        // so rather than claim it stopped early.
+        const pending = conversationView(runtime, agent, ledger).pending
+        more = pending.length > 0 && estimateMessages(pending) >= runtime.config.observeAfterTokens
+      }
+    }
+    if (chunks > 0) runtime.stats.catchUpChunks += chunks
+    runtime.stats.catchUpActive = more
+    if (more) {
+      outcomes.push(`catch-up: stopped at the ${limit}-chunk cap; more backlog remains`)
+    }
+
     const reflector = await runReflector(runtime, agent, ledger, signal)
     if (reflector !== null) outcomes.push(reflector)
     // Pruning is post-reflection maintenance only, so it can see the reflections
@@ -1124,6 +1480,7 @@ export async function runMemoryPass(runtime, agent, signal) {
       const dropper = await runDropper(runtime, agent, ledger, signal)
       if (dropper !== null) outcomes.push(dropper)
     }
+
     if (outcomes.length > 0) runtime.log('info', outcomes.join('; '))
     runtime.stats.lastOutcome = outcomes.length === 0 ? 'nothing due' : outcomes.join('; ')
     runtime.stats.passesCompleted += 1
@@ -1135,8 +1492,17 @@ export async function runMemoryPass(runtime, agent, signal) {
   }
 }
 
-/** Sessions with a memory run in flight, so turns cannot stack runs. */
-const inFlight = new Set()
+/**
+ * Sessions with a memory run in flight, so turns cannot stack runs.
+ *
+ * The value is the run's start time, not `true`: a run that hangs (or whose
+ * abort is ignored) would otherwise hold the slot forever, and because the
+ * scheduler skips a session that already has a run, that one hang disables
+ * memory for the whole process lifetime. A start time lets a stale slot be
+ * reclaimed.
+ * @type {Map<string, number>}
+ */
+const inFlight = new Map()
 
 /**
  * Whether an agent is a root session rather than a delegated child.
@@ -1198,11 +1564,19 @@ export function scheduleMemoryPass(runtime, agent) {
   if (config.passive) return
   const sessionId = agent?.session?.id
   if (typeof sessionId !== 'string' || !SESSION_ID_PATTERN.test(sessionId)) return
-  if (inFlight.has(sessionId)) return
+  const startedAt = inFlight.get(sessionId)
+  if (startedAt !== undefined) {
+    if (Date.now() - startedAt < runtime.config.passTimeoutMs) return
+    // Stale slot: the previous run never finished. Reclaim it rather than let
+    // one hung call silence every later turn.
+    inFlight.delete(sessionId)
+    runtime.stats.stalePassesReclaimed += 1
+    runtime.log('warn', `reclaimed a stale memory run for ${sessionId}`)
+  }
   if (config.rootAgentsOnly && !isRootAgent(runtime, agent)) return
   const controller = new AbortController()
   runtime.inflight.add(controller)
-  inFlight.add(sessionId)
+  inFlight.set(sessionId, Date.now())
   void (async () => {
     try {
       // `runMemoryPass` owns the started/completed/failed accounting.
@@ -1269,7 +1643,8 @@ export function wrapCompactionEngine(runtime, engine) {
         const rendered = renderMemory(ledger)
         if (rendered !== null) {
           const shadowed = estimateShadowedTokens(runtime, input)
-          if (!coversShadowedRegion(ledger, shadowed)) {
+          const view = conversationView(runtime, agent, ledger)
+          if (!coversShadowedRegion(ledger, shadowed, view.coveredTokens)) {
             // Partial coverage. A checkpoint built from it would look complete
             // while describing only a prefix of what it replaced — a lie by
             // omission, and worse than the summary it displaced.
@@ -1457,6 +1832,7 @@ export function registerCommands(runtime) {
           `reflections: ${ledger.reflections.length}`,
           `active observation tokens: ~${activeObservationTokens(ledger)}`,
           `observed messages: ${ledger.observedCount}`,
+          `observed anchor: ${ledger.observedSeq === undefined ? 'none' : ledger.observedSeq}`,
           `last update: ${ledger.updatedAt}`
         ].join('\n')
       }
@@ -1632,16 +2008,28 @@ async function probe(runtime, request) {
         ? undefined
         : Math.max(0, Math.min(100, Math.round((value / limit) * 100)))
 
-    let pendingTokens
+    // Every figure below comes from one derived view, so the observer's own
+    // clock and the number the panel shows cannot disagree.
+    let view
     try {
-      pendingTokens =
-        agent === undefined
-          ? undefined
-          : estimateShadowedTokens(runtime, { messages: agent.session.deriveMessages().slice(ledger.observedCount) })
+      view = agent === undefined ? undefined : conversationView(runtime, agent, ledger)
     } catch {
-      pendingTokens = undefined
+      view = undefined
     }
+    const pendingTokens = view?.pendingTokens
+    const coveredTokens = view?.coveredTokens
+    const conversationTokens = view?.conversationTokens
+    const observedConversationTokens =
+      Number.isFinite(conversationTokens) && conversationTokens > 0 ? conversationTokens : undefined
+    const reflectionView =
+      agent === undefined ? undefined : conversationView(runtime, agent, ledger, ledger.reflectedSeq ?? null)
     const activeTokens = activeObservationTokens(ledger)
+    // The reflector is scheduled on conversation that has flowed past since the
+    // last reflection, so that is what the widget must show. Reporting the pool
+    // size here would be a reading the scheduler never consults: it would sit at
+    // 100% while the real trigger stayed untouched, and the reader would have no
+    // way to tell the two apart.
+    const sinceReflection = reflectionView?.pendingTokens ?? 0
 
     return {
       ...base,
@@ -1659,21 +2047,42 @@ async function probe(runtime, request) {
         percent: percent(pendingTokens, runtime.config.observeAfterTokens)
       },
       reflect: {
+        pendingTokens: reflectionView?.pendingTokens,
         activeTokens,
         thresholdTokens: runtime.config.reflectAfterTokens,
-        percent: percent(activeTokens, runtime.config.reflectAfterTokens)
+        percent: percent(sinceReflection, runtime.config.reflectAfterTokens)
       },
       compact: { percent: percent(usedTokens, thresholdTokens) },
       ledger: {
         observations: ledger.observations.length,
         activeObservations: activeObservations(ledger).length,
         reflections: ledger.reflections.length,
-        observedTokens: ledger.observedTokens,
-        // How much of the history the ledger can describe. Below 100% the
-        // renderer refuses and compaction falls back to the summarizer.
-        coveragePercent: percent(ledger.observedTokens, thresholdTokens)
+        observedTokens: coveredTokens,
+        /**
+         * How much of the LIVE conversation the ledger has read.
+         *
+         * Measured against the conversation itself, not the compaction threshold.
+         * The threshold answers a different question — "is the ledger big enough
+         * to stand in for the region compaction would replace" — and that is what
+         * `coversShadowedRegion` checks at render time. Using it here meant the
+         * widget could never approach 100%: it plateaued in the seventies however
+         * caught up the reader actually was, because the threshold is a trigger
+         * line, not the amount of history that exists.
+         */
+        coveragePercent: percent(coveredTokens, observedConversationTokens),
+        /** The same fact in absolute terms, so the reading can be checked. */
+        conversationTokens: observedConversationTokens,
+        unreadTokens: pendingTokens
       }
     }
+  }
+
+  let summaryView
+  try {
+    const summaryAgent = runtime.ctx.get('agents')?.get(sessionId)
+    if (summaryAgent !== undefined) summaryView = conversationView(runtime, summaryAgent, ledger)
+  } catch {
+    summaryView = undefined
   }
 
   const summary = {
@@ -1681,8 +2090,12 @@ async function probe(runtime, request) {
     activeObservations: activeObservations(ledger).length,
     reflections: ledger.reflections.length,
     dropped: ledger.dropped.length,
+    observedSeq: ledger.observedSeq,
     observedCount: ledger.observedCount,
-    observedTokens: ledger.observedTokens,
+    reflectedSeq: ledger.reflectedSeq,
+    // Derived from the anchors, never stored: see `conversationView`.
+    observedTokens: summaryView?.coveredTokens,
+    conversationTokens: summaryView?.conversationTokens,
     updatedAt: ledger.updatedAt
   }
 
@@ -1741,7 +2154,7 @@ async function probe(runtime, request) {
       kind: 'ok',
       summary,
       derivedMessages: messages.length,
-      pendingTokens: estimateMessages(messages.slice(ledger.observedCount)),
+      pendingTokens: conversationView(runtime, agent, ledger).pendingTokens,
       outcomes
     }
   }
@@ -1924,14 +2337,4 @@ export function apply(ctx, rawConfig) {
   // Cordis ignores a plugin's return value; returning the runtime makes the
   // activation steps inspectable in tests.
   return runtime
-}
-
-/** Exposed for tests; not part of the plugin contract. */
-export const __testing = {
-  estimateMessages,
-  takeOldestChunk,
-  serializeMessages,
-  resolveTarget,
-  callMemoryModel,
-  stamp
 }

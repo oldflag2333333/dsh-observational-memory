@@ -127,23 +127,14 @@ window.__ModuleLoader__.load({
       observe: { zh: '下一次观察', en: 'Next observe' },
       reflect: { zh: '下一次反思', en: 'Next reflect' },
       compact: { zh: '下一次压缩', en: 'Next compact' },
-      coverage: { zh: '账本覆盖', en: 'Ledger coverage' },
-      counts: {
-        zh: '{observations} 条观察 · {reflections} 条反思',
-        en: '{observations} observations · {reflections} reflections'
+      // One line in plain reading order: how much of the conversation has been
+      // read (with the absolute numbers beside it, so the percentage can be
+      // checked rather than trusted), then what the ledger holds.
+      coverage: {
+        zh: '已读会话 {percent} · {observations} 条观察 · {reflections} 条反思',
+        en: 'Read {percent} of the session · {observations} observations · {reflections} reflections'
       },
-      ofThreshold: { zh: '上限 {limit}', en: 'limit {limit}' },
-      unread: { zh: '未读 {value}', en: '{value} unread' },
-      pool: { zh: '活跃池 {value}', en: '{value} in pool' },
-      context: { zh: '上下文 {value}', en: '{value} context' },
-      hint: {
-        zh: '占压缩阈值 {percent} · 点击查看下次观察、反思与压缩',
-        en: '{percent} of the compaction threshold · click for the next observe, reflect and compact'
-      },
-      coverageHint: {
-        zh: '覆盖不足时压缩会回退到原生总结器，而不是用不完整的记忆替换历史。',
-        en: 'Below full coverage, compaction falls back to the shipped summarizer rather than replacing history with partial memory.'
-      }
+      hint: { zh: '观察记忆 {percent}', en: 'Observational memory {percent}' }
     }
 
     /** Flat dictionaries per built-in locale id (`zh` / `en`). */
@@ -367,40 +358,32 @@ window.__ModuleLoader__.load({
                 label: t('observe'),
                 percent: usage.observe?.percent,
                 tint: 'omx_colorObserve',
-                reading: `${t('unread', { value: formatTokens(usage.observe?.pendingTokens) })} · ${t('ofThreshold', {
-                  limit: formatTokens(usage.observe?.thresholdTokens)
-                })}`
+                          reading: `${formatTokens(usage.observe?.pendingTokens)} / ${formatTokens(usage.observe?.thresholdTokens)}`
               }),
               h(MeterRow, {
                 label: t('reflect'),
                 percent: usage.reflect?.percent,
                 tint: 'omx_colorReflect',
-                reading: `${t('pool', { value: formatTokens(usage.reflect?.activeTokens) })} · ${t('ofThreshold', {
-                  limit: formatTokens(usage.reflect?.thresholdTokens)
-                })}`
+                // The reading is the raw conversation since the last reflection,
+                // because that is what schedules the reflector. The pool is what
+                // the reflector distils, but it never triggers a run, so it is
+                // not shown beside a threshold it does not answer to.
+                reading: `${formatTokens(usage.reflect?.pendingTokens)} / ${formatTokens(usage.reflect?.thresholdTokens)}`
               }),
               h(MeterRow, {
                 label: t('compact'),
                 percent: usage.compact?.percent,
                 tint: 'omx_colorCompact',
-                reading: `${t('context', { value: formatTokens(usage.context?.usedTokens) })} · ${t('ofThreshold', {
-                  limit: formatTokens(limit)
-                })}`
+                reading: `${formatTokens(usage.context?.usedTokens)} / ${formatTokens(limit)}`
               }),
               h(
                 'div',
                 { className: 'omx_note' },
-                h(
-                  'div',
-                  null,
-                  `${t('coverage')} ${
-                    usage.ledger?.coveragePercent === undefined ? '—' : `${usage.ledger.coveragePercent}%`
-                  } · ${t('counts', {
-                    observations: usage.ledger?.activeObservations ?? 0,
-                    reflections: usage.ledger?.reflections ?? 0
-                  })}`
-                ),
-                h('div', null, t('coverageHint'))
+                t('coverage', {
+                  percent: usage.ledger?.coveragePercent === undefined ? '—' : `${usage.ledger.coveragePercent}%`,
+                  observations: usage.ledger?.activeObservations ?? 0,
+                  reflections: usage.ledger?.reflections ?? 0
+                })
               )
             )
           : null
